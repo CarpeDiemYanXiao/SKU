@@ -42,18 +42,17 @@ env:
 # ============ 动作配置 (核心优化) ============
 action:
   type: "discrete"
-  # 关键: 补货系数范围 [0, 1.0]
-  # 0 = 完全不补, 1.0 = 补满预测量
-  multiplier_range: [0.0, 1.0]
+  # 关键修改: 允许补货1.5倍预测量，保证ACC
+  multiplier_range: [0.5, 1.5]
   multiplier_step: 0.1
 
 # ============ 奖励配置 (核心优化) ============
 reward:
   type: "balanced"
   weights:
-    sell_ratio: 1.0       # 销售达成率奖励 (sold/demand)
-    rts_penalty: 3.0      # RTS惩罚 (适中，不要太大)
-    overstock_penalty: 0.5  # 库存过多惩罚
+    sell_ratio: 3.0       # 销售达成率奖励 (大幅提高!)
+    rts_penalty: 1.0      # RTS惩罚 (降低，让模型敢补货)
+    overstock_penalty: 0.2  # 库存过多惩罚 (降低)
   targets:
     max_rts_rate: 0.024
   normalize: true

@@ -351,16 +351,16 @@ class BalancedReward(BaseReward):
     平衡型 Reward 设计
     
     核心思路: 直接优化 ACC 和 RTS 的平衡
-    - 销售达成率奖励: sold / demand (提高ACC)
-    - RTS惩罚: 只在发生RTS时惩罚
-    - 库存过多惩罚: 预防性控制
+    - 销售奖励: 卖出去就给奖励 (鼓励补货)
+    - 缺货惩罚: 缺货就惩罚 (鼓励补货)
+    - RTS惩罚: 发生RTS时惩罚
     """
     
     def __init__(
         self,
-        sell_ratio_weight: float = 1.0,
-        rts_weight: float = 3.0,
-        overstock_weight: float = 0.5,
+        sell_ratio_weight: float = 3.0,
+        rts_weight: float = 1.0,
+        overstock_weight: float = 0.2,
         max_rts_rate: float = 0.024,
         normalize: bool = True,
         clip_range: tuple = (-5, 5),
@@ -389,43 +389,41 @@ class BalancedReward(BaseReward):
         
         avg_sales = state_info.get("avg_daily_sales", 1.0)
         pred_y = state_info.get("pred_y", 1.0)
-        demand = sold + stockout  # 实际需求 = 卖掉的 + 缺货的
+        norm_factor = max(avg_sales, pred_y, 1.0)
+        demand = sold + stockout  # 实际需求
         
         # 更新统计
         self._total_rts += rts
         self._total_replenish += replenish
         
-        # ========== 1. 销售达成率奖励 (核心: 提高ACC) ==========
-        if demand > 0:
-            sell_ratio = sold / demand  # 0~1
-        else:
-            sell_ratio = 1.0  # 无需求时不惩罚
+        # ========== 1. 销售奖励 (核心: 提高ACC) ==========
+        # 卖出越多越好
+        sell_reward = self.sell_ratio_weight * (sold / norm_factor)
         
-        sell_reward = self.sell_ratio_weight * sell_ratio
+        # ========== 2. 缺货惩罚 (核心: 鼓励补货) ==========
+        # 缺货越多惩罚越重
+        stockout_penalty = self.sell_ratio_weight * 0.5 * (stockout / norm_factor)
         
-        # ========== 2. RTS惩罚 (核心: 控制RTS) ==========
+        # ========== 3. RTS惩罚 (核心: 控制RTS) ==========
         rts_penalty = 0.0
         if rts > 0:
-            # RTS惩罚与补货量成比例
-            norm_factor = max(avg_sales, pred_y, 1.0)
             rts_penalty = self.rts_weight * (rts / norm_factor)
         
-        # ========== 3. 库存过多惩罚 (预防性) ==========
+        # ========== 4. 库存过多惩罚 (预防性，较弱) ==========
         overstock_penalty = 0.0
         days_of_stock = end_stock / max(avg_sales, 0.1)
-        if days_of_stock > 10:  # 超过10天库存开始惩罚
-            overstock_penalty = self.overstock_weight * min((days_of_stock - 10) / 10, 1.0)
+        if days_of_stock > 12:  # 放宽到12天
+            overstock_penalty = self.overstock_weight * min((days_of_stock - 12) / 10, 1.0)
         
-        # ========== 4. 累计RTS率惩罚 ==========
+        # ========== 5. 累计RTS率惩罚 (软约束) ==========
         cumulative_penalty = 0.0
-        if self._total_replenish > 0:
+        if self._total_replenish > 100:  # 有一定补货量后才计算
             current_rts_rate = self._total_rts / self._total_replenish
             if current_rts_rate > self.max_rts_rate:
-                # 超过目标RTS率，给额外惩罚
-                cumulative_penalty = 2.0 * (current_rts_rate - self.max_rts_rate)
+                cumulative_penalty = 1.0 * (current_rts_rate - self.max_rts_rate)
         
         # 总reward
-        reward = sell_reward - rts_penalty - overstock_penalty - cumulative_penalty
+        reward = sell_reward - stockout_penalty - rts_penalty - overstock_penalty - cumulative_penalty
         reward = np.clip(reward, self.clip_range[0], self.clip_range[1])
         
         self._components = {

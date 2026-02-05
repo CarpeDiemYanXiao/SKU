@@ -1,0 +1,32 @@
+# Output directories
+replenishment_v2/output/
+rl_0113/replenishment_abo/output/
+rl_0113/replenishment_multi/output/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Logs
+*.log
+tensorboard/
+
+# Data (optional, uncomment if needed)
+# *.parquet
+# *.csv
+
+# Model checkpoints (keep in output, which is already ignored)
+*.pth
+*.onnx
+
+# Jupyter
+.ipynb_checkpoints/

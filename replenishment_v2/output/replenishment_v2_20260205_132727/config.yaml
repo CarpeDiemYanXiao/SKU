@@ -1,0 +1,91 @@
+action:
+  multiplier_range:
+  - 0.0
+  - 1.0
+  multiplier_step: 0.1
+  type: discrete
+data:
+  eval_path: ../data/2000_sku.parquet
+  train_path: ../data/2000_sku.parquet
+env:
+  max_leadtime: 5
+  rts_days: 14
+  state_features:
+    dynamic:
+    - current_stock
+    - transit_day_1
+    - transit_day_2
+    - transit_day_3
+    - transit_day_4
+    - transit_day_5
+    - total_transit
+    - stock_health
+    - days_of_stock
+    - near_expire_ratio
+    - avg_stock_age
+    static:
+    - leadtime
+    - pred_y
+    - demand_freq
+    - order_ratio_l7d
+    - order_ratio_l14d
+    - avg_daily_item_qty_l7d
+    - avg_daily_item_qty_l14d
+    - std_daily_item_qty_l7d
+    - std_daily_item_qty_l14d
+    - trend_item_qty_l3d_minus_l7d
+    - trend_item_qty_l3d_minus_l14d
+logging:
+  log_dir: output
+  print_interval: 5
+  save_best_only: true
+  tensorboard: true
+network:
+  activation: relu
+  dropout: 0.0
+  hidden_dims:
+  - 256
+  - 128
+  - 64
+  init_gain: 1.0
+  init_method: orthogonal
+  use_layer_norm: true
+  use_residual: false
+ppo:
+  batch_size: 2048
+  clip_epsilon: 0.2
+  entropy_coef: 0.02
+  gae_lambda: 0.95
+  gamma: 0.99
+  k_epochs: 4
+  lr_actor: 0.0003
+  lr_critic: 0.0003
+  max_grad_norm: 0.5
+  normalize_advantages: true
+  value_loss_coef: 0.5
+  weight_decay: 0.0
+reward:
+  clip_range:
+  - -5
+  - 5
+  normalize: true
+  targets:
+    max_rts_rate: 0.024
+  type: balanced
+  weights:
+    overstock_penalty: 0.5
+    rts_penalty: 3.0
+    sell_ratio: 1.0
+task:
+  device: cuda:0
+  name: replenishment_v2
+  seed: 42
+training:
+  curriculum:
+    enabled: false
+  early_stop_patience: 150
+  eval_interval: 10
+  max_episodes: 600
+  save_interval: 50
+  target_acc: 80.0
+  target_rts: 2.4
