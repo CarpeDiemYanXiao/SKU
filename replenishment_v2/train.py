@@ -54,7 +54,7 @@ def train_episode(
     Returns:
         episode 统计信息
     """
-    buffer.reset()
+    # 注意：不在这里 reset buffer，让 buffer 可以累积多个 episode
     state_map = env.reset()
     
     sku_ids = list(state_map.keys())
@@ -252,6 +252,7 @@ def main():
     eval_interval = train_cfg["eval_interval"]
     save_interval = train_cfg["save_interval"]
     print_interval = config["logging"].get("print_interval", 5)
+    accumulate_episodes = train_cfg.get("accumulate_episodes", 1)  # NPU优化：累积多个episode
     
     # 课程学习
     curriculum_cfg = train_cfg.get("curriculum", {})
@@ -275,6 +276,7 @@ def main():
     buffer = RolloutBuffer()
     
     print(f"[Train] Starting training for {max_episodes} episodes...")
+    print(f"[Train] NPU optimization: accumulate {accumulate_episodes} episodes before update")
     print("=" * 60)
     
     # 创建进度条 (每5轮更新一次)
@@ -306,10 +308,11 @@ def main():
         # 训练一个 episode
         episode_stats = train_episode(env, agent, buffer)
         
-        # PPO 更新
-        if len(buffer) > 0:
+        # PPO 更新（累积多个episode后再更新，提高NPU利用率）
+        if len(buffer) > 0 and episode % accumulate_episodes == 0:
             rollout_data = buffer.get()
             train_stats = agent.update(rollout_data)
+            buffer.reset()  # 更新后清空buffer
         else:
             train_stats = {"policy_loss": 0, "value_loss": 0, "entropy": 0}
         

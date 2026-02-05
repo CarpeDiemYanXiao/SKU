@@ -31,6 +31,7 @@ class PPOAgent:
         self.max_grad_norm = ppo_cfg["max_grad_norm"]
         self.k_epochs = ppo_cfg["k_epochs"]
         self.batch_size = ppo_cfg["batch_size"]
+        self.mini_batch_size = ppo_cfg.get("mini_batch_size", 512)  # NPU优化：使用mini-batch
         self.normalize_advantages = ppo_cfg["normalize_advantages"]
         
         # 动作配置
@@ -163,8 +164,9 @@ class PPOAgent:
         for _ in range(self.k_epochs):
             np.random.shuffle(indices)
             
-            for start in range(0, n_samples, self.batch_size):
-                end = min(start + self.batch_size, n_samples)
+            # 使用 mini_batch_size 进行更新
+            for start in range(0, n_samples, self.mini_batch_size):
+                end = min(start + self.mini_batch_size, n_samples)
                 batch_indices = indices[start:end]
                 
                 batch_states = states[batch_indices]

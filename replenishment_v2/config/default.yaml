@@ -79,8 +79,9 @@ ppo:
   lr_actor: 0.0003
   lr_critic: 0.0003
   weight_decay: 0.0
-  k_epochs: 4
-  batch_size: 2048
+  k_epochs: 10            # 增加更新轮数，充分利用 NPU
+  batch_size: 4096        # 增大批量，提高 NPU 利用率
+  mini_batch_size: 512    # mini-batch 大小
   normalize_advantages: true
 
 # ============ 训练配置 ============
@@ -91,6 +92,7 @@ training:
   early_stop_patience: 150
   target_rts: 2.4
   target_acc: 80.0
+  accumulate_episodes: 2  # 累积多个 episode 再更新，增大有效 batch
   curriculum:
     enabled: false
 
