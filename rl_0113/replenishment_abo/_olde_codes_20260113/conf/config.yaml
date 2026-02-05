@@ -1,0 +1,30 @@
+gunicorn:
+  bind: "0.0.0.0:80"
+  workers: 15
+  threads: 1
+  timeout: 1000
+  keepalive: 1000
+  daemon: false
+  loglevel: "info"
+shmem:
+  max_blocks: 1000
+  type: basic
+model:
+  max_encoder_length: 14
+  max_prediction_length: 6
+  x_categoricals_length: 6
+  x_reals_length: 12
+  batch_size: 50
+predictors:
+  default:
+    log_level: info
+    backend: TorchBackend
+    device: "cpu"
+    model_repo_dir: '/workspace/model'
+    # batching:
+    #   type: dynamic
+    #   max_batch_size: 4
+    #   max_delay_time_ms: 1
+    #   num_workers: 1
+    #   preserve_slo: true
+    warmup_times: 10 

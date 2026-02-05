@@ -1,0 +1,3 @@
+bind_reward换用14天（rts）的计算口径
+v1为之用14d_bind_reward
+v2为lt_bind_reward 和 14d_bind_reward加权

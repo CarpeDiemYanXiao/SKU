@@ -1,0 +1,35 @@
+import torch
+import torch.nn as nn
+
+
+class PolicyNetwork(nn.Module):
+    def __init__(self, state_dim, action_dim, hidden_dim=64):
+        """
+        初始化策略网络
+
+        参数:
+            state_dim (int): 状态空间维度
+            action_dim (int): 动作空间维度
+            hidden_dim (int): 隐藏层维度，默认为64
+        """
+        super(PolicyNetwork, self).__init__()
+        print(state_dim)
+        self.fc1 = nn.Linear(state_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.action_head = nn.Linear(hidden_dim, action_dim)
+
+    def forward(self, x):
+        """
+        前向传播函数
+
+        参数:
+            x (torch.Tensor): 输入状态张量
+
+        返回:
+            tuple: (action_probs, None)
+                - action_probs: 动作概率分布
+        """
+        x = torch.relu(self.fc1(x))
+        x = torch.relu(self.fc2(x))
+        action_probs = torch.softmax(self.action_head(x), dim=-1)
+        return action_probs

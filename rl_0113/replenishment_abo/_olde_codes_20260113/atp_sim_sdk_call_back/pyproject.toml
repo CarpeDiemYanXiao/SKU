@@ -1,0 +1,12 @@
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "atp-sim-sdk-py"
+version = "0.1.0"
+description = "atp simulation python sdk. rolling calculate"
+authors = [{ name = "Chunjie Li", email = "chunjie.li@shopee.com" }]
+requires-python = ">=3.10"
+dependencies = [
+]

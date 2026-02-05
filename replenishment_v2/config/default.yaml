@@ -1,0 +1,102 @@
+# 电商库存补货 RL 配置文件
+# 目标: RTS≤2.4%, ACC≥80%
+
+task:
+  name: "replenishment_v2"
+  seed: 42
+  device: "cuda:0"
+
+data:
+  train_path: "../data/2000_sku.parquet"
+  eval_path: "../data/2000_sku.parquet"
+
+env:
+  rts_days: 14
+  max_leadtime: 5
+  state_features:
+    dynamic:
+      - "current_stock"
+      - "transit_day_1"
+      - "transit_day_2"
+      - "transit_day_3"
+      - "transit_day_4"
+      - "transit_day_5"
+      - "total_transit"
+      - "stock_health"
+      - "days_of_stock"
+      - "near_expire_ratio"
+      - "avg_stock_age"
+    static:
+      - "leadtime"
+      - "pred_y"
+      - "demand_freq"
+      - "order_ratio_l7d"
+      - "order_ratio_l14d"
+      - "avg_daily_item_qty_l7d"
+      - "avg_daily_item_qty_l14d"
+      - "std_daily_item_qty_l7d"
+      - "std_daily_item_qty_l14d"
+      - "trend_item_qty_l3d_minus_l7d"
+      - "trend_item_qty_l3d_minus_l14d"
+
+# ============ 动作配置 (核心优化) ============
+action:
+  type: "discrete"
+  # 关键: 补货系数范围 [0, 1.0]
+  # 0 = 完全不补, 1.0 = 补满预测量
+  multiplier_range: [0.0, 1.0]
+  multiplier_step: 0.1
+
+# ============ 奖励配置 (核心优化) ============
+reward:
+  type: "balanced"
+  weights:
+    sell_ratio: 1.0       # 销售达成率奖励 (sold/demand)
+    rts_penalty: 3.0      # RTS惩罚 (适中，不要太大)
+    overstock_penalty: 0.5  # 库存过多惩罚
+  targets:
+    max_rts_rate: 0.024
+  normalize: true
+  clip_range: [-5, 5]
+
+# ============ 网络配置 ============
+network:
+  hidden_dims: [256, 128, 64]
+  activation: "relu"
+  use_layer_norm: true
+  use_residual: false
+  dropout: 0.0
+  init_method: "orthogonal"
+  init_gain: 1.0
+
+# ============ PPO 配置 ============
+ppo:
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_epsilon: 0.2
+  entropy_coef: 0.02      # 增加探索
+  value_loss_coef: 0.5
+  max_grad_norm: 0.5
+  lr_actor: 0.0003
+  lr_critic: 0.0003
+  weight_decay: 0.0
+  k_epochs: 4
+  batch_size: 2048
+  normalize_advantages: true
+
+# ============ 训练配置 ============
+training:
+  max_episodes: 600
+  eval_interval: 10
+  save_interval: 50
+  early_stop_patience: 150
+  target_rts: 2.4
+  target_acc: 80.0
+  curriculum:
+    enabled: false
+
+logging:
+  log_dir: "output"
+  tensorboard: true
+  print_interval: 5
+  save_best_only: true

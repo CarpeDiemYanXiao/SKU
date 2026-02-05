@@ -1,0 +1,290 @@
+"""
+强化学习环境
+Gym 风格的库存补货环境
+"""
+
+import numpy as np
+import gymnasium as gym
+from gymnasium import spaces
+from typing import Dict, List, Tuple, Optional, Any
+from .dataset import ReplenishmentDataset
+from .simulator import InventorySimulator, SKUState
+from .reward import BaseReward, create_reward
+
+
+class ReplenishmentEnv(gym.Env):
+    """
+    库存补货环境
+    
+    同时管理多个 SKU，每个 SKU 独立模拟
+    """
+    
+    def __init__(
+        self,
+        dataset: ReplenishmentDataset,
+        reward_fn: BaseReward,
+        config: dict,
+    ):
+        super().__init__()
+        
+        self.dataset = dataset
+        self.reward_fn = reward_fn
+        self.config = config
+        
+        # 环境配置
+        env_cfg = config["env"]
+        self.rts_days = env_cfg["rts_days"]
+        self.max_leadtime = env_cfg["max_leadtime"]
+        
+        # 动作配置
+        action_cfg = config["action"]
+        self.action_type = action_cfg["type"]
+        self.multiplier_range = action_cfg["multiplier_range"]
+        
+        if self.action_type == "discrete":
+            step = action_cfg["multiplier_step"]
+            self.action_list = np.arange(
+                self.multiplier_range[0],
+                self.multiplier_range[1] + step,
+                step
+            ).round(2).tolist()
+            self.n_actions = len(self.action_list)
+        else:
+            self.action_list = None
+            self.n_actions = 1
+        
+        # 状态特征配置
+        self.dynamic_features = env_cfg["state_features"]["dynamic"]
+        self.static_features = env_cfg["state_features"]["static"]
+        self.state_dim = len(self.dynamic_features) + len(self.static_features)
+        
+        # 模拟器
+        self.simulator = InventorySimulator(rts_days=self.rts_days)
+        
+        # SKU 列表
+        self.sku_ids = dataset.sku_ids
+        self.n_skus = len(self.sku_ids)
+        
+        # 状态
+        self.sku_states: Dict[str, SKUState] = {}
+        self.day_idx_map: Dict[str, int] = {}
+        self.done_map: Dict[str, bool] = {}
+        
+        # 定义空间
+        self.observation_space = spaces.Box(
+            low=-np.inf, high=np.inf, shape=(self.state_dim,), dtype=np.float32
+        )
+        
+        if self.action_type == "discrete":
+            self.action_space = spaces.Discrete(self.n_actions)
+        else:
+            self.action_space = spaces.Box(
+                low=self.multiplier_range[0],
+                high=self.multiplier_range[1],
+                shape=(1,),
+                dtype=np.float32
+            )
+    
+    def reset(self, seed: Optional[int] = None) -> Dict[str, np.ndarray]:
+        """
+        重置环境
+        
+        Returns:
+            state_map: {sku_id: state_vector}
+        """
+        super().reset(seed=seed)
+        
+        self.sku_states = {}
+        self.day_idx_map = {}
+        self.done_map = {}
+        
+        state_map = {}
+        
+        for sku_id in self.sku_ids:
+            # 初始化模拟器状态
+            initial_stock = self.dataset.initial_stock_map.get(sku_id, 0)
+            self.sku_states[sku_id] = self.simulator.init_sku(sku_id, initial_stock)
+            self.day_idx_map[sku_id] = 0
+            self.done_map[sku_id] = False
+            
+            # 构建初始状态向量
+            state_map[sku_id] = self._get_state_vector(sku_id)
+        
+        # 重置 reward (如果有状态)
+        if hasattr(self.reward_fn, 'reset'):
+            self.reward_fn.reset()
+        
+        return state_map
+    
+    def step(
+        self, 
+        action_map: Dict[str, Any]
+    ) -> Tuple[Dict[str, np.ndarray], Dict[str, float], Dict[str, bool], Dict[str, dict]]:
+        """
+        执行一步
+        
+        Args:
+            action_map: {sku_id: action}
+                - 离散: action 是索引
+                - 连续: action 是 multiplier 值
+                
+        Returns:
+            next_state_map, reward_map, done_map, info_map
+        """
+        next_state_map = {}
+        reward_map = {}
+        info_map = {}
+        
+        for sku_id in self.sku_ids:
+            if self.done_map[sku_id]:
+                continue
+            
+            if sku_id not in action_map:
+                continue
+            
+            day_idx = self.day_idx_map[sku_id]
+            sku_state = self.sku_states[sku_id]
+            
+            # 获取当天数据
+            leadtime = self.dataset.get_leadtime(sku_id, day_idx)
+            actual_sales = self.dataset.get_sales(sku_id, day_idx)
+            pred_y = self.dataset.get_pred_y(sku_id, day_idx)
+            
+            # 解析动作
+            action = action_map[sku_id]
+            if self.action_type == "discrete":
+                multiplier = self.action_list[action]
+            else:
+                multiplier = float(action)
+            
+            # 计算补货量
+            replenish_qty = max(0, pred_y * multiplier)
+            
+            # 模拟一天
+            new_state, step_info = self.simulator.step(
+                state=sku_state,
+                replenish_qty=replenish_qty,
+                actual_sales=actual_sales,
+                leadtime=leadtime,
+            )
+            self.sku_states[sku_id] = new_state
+            
+            # 计算 reward
+            avg_sales = self.dataset.get_avg_qty_7d(sku_id, day_idx)
+            demand_freq = 0.5
+            if self.dataset.demand_freq_map:
+                demand_freq = self.dataset.demand_freq_map[sku_id][day_idx]
+            
+            state_info = {
+                "avg_daily_sales": avg_sales,
+                "pred_y": pred_y,
+                "demand_freq": demand_freq,
+            }
+            
+            reward = self.reward_fn.compute(step_info, state_info)
+            
+            # 更新天数
+            self.day_idx_map[sku_id] = day_idx + 1
+            
+            # 检查是否结束
+            n_days = self.dataset.get_n_days(sku_id)
+            if self.day_idx_map[sku_id] >= n_days:
+                self.done_map[sku_id] = True
+            
+            # 构建下一状态
+            if not self.done_map[sku_id]:
+                next_state_map[sku_id] = self._get_state_vector(sku_id)
+            else:
+                # 终止状态用零向量
+                next_state_map[sku_id] = np.zeros(self.state_dim, dtype=np.float32)
+            
+            reward_map[sku_id] = reward
+            info_map[sku_id] = {
+                "step_info": step_info,
+                "multiplier": multiplier,
+                "replenish_qty": replenish_qty,
+                "reward_components": self.reward_fn.get_components(),
+            }
+        
+        return next_state_map, reward_map, self.done_map.copy(), info_map
+    
+    def _get_state_vector(self, sku_id: str) -> np.ndarray:
+        """构建状态向量"""
+        day_idx = self.day_idx_map[sku_id]
+        sku_state = self.sku_states[sku_id]
+        
+        # 动态特征
+        dynamic = []
+        
+        for feat_name in self.dynamic_features:
+            if feat_name == "current_stock":
+                dynamic.append(sku_state.current_stock)
+            elif feat_name.startswith("transit_day_"):
+                idx = int(feat_name.split("_")[-1]) - 1
+                dynamic.append(sku_state.transit_stock[idx] if idx < len(sku_state.transit_stock) else 0.0)
+            elif feat_name == "stock_health":
+                avg_sales = self.dataset.get_avg_qty_7d(sku_id, day_idx)
+                dynamic.append(self.simulator.get_stock_health(sku_state, avg_sales))
+            elif feat_name == "days_of_stock":
+                avg_sales = self.dataset.get_avg_qty_7d(sku_id, day_idx)
+                dynamic.append(self.simulator.get_days_of_stock(sku_state, avg_sales))
+            elif feat_name == "near_expire_ratio":
+                dynamic.append(self.simulator.get_near_expire_ratio(sku_state))
+            elif feat_name == "avg_stock_age":
+                dynamic.append(self.simulator.get_avg_stock_age(sku_state))
+            elif feat_name == "total_transit":
+                dynamic.append(sum(sku_state.transit_stock))
+            else:
+                dynamic.append(0.0)
+        
+        # 静态特征
+        static = self.dataset.get_static_features(sku_id, day_idx)
+        
+        # 合并
+        state = np.array(dynamic + static, dtype=np.float32)
+        
+        # 处理 NaN 和 Inf
+        state = np.nan_to_num(state, nan=0.0, posinf=1e6, neginf=-1e6)
+        
+        return state
+    
+    def get_metrics(self) -> Dict[str, float]:
+        """获取全局指标"""
+        total_replenish = 0.0
+        total_bind = 0.0
+        total_sales = 0.0
+        total_rts = 0.0
+        total_overnight = 0.0
+        total_stockout = 0.0
+        
+        for sku_id in self.sku_ids:
+            summary = self.simulator.get_summary(self.sku_states[sku_id])
+            total_replenish += summary["total_replenish"]
+            total_bind += summary["total_bind"]
+            total_sales += summary["total_sales"]
+            total_rts += summary["total_rts"]
+            total_overnight += summary["total_overnight"]
+            total_stockout += summary["total_stockout"]
+        
+        # 计算指标
+        market_sales = self.dataset.total_sales
+        acc = total_sales / market_sales * 100 if market_sales > 0 else 0.0
+        rts_rate = total_rts / total_replenish * 100 if total_replenish > 0 else 0.0
+        
+        return {
+            "acc": acc,
+            "rts_rate": rts_rate,
+            "total_replenish": total_replenish,
+            "total_bind": total_bind,
+            "total_sales": total_sales,
+            "total_rts": total_rts,
+            "total_overnight": total_overnight,
+            "total_stockout": total_stockout,
+            "market_sales": market_sales,
+        }
+
+
+def create_env(dataset: ReplenishmentDataset, config: dict) -> ReplenishmentEnv:
+    """创建环境"""
+    reward_fn = create_reward(config)
+    return ReplenishmentEnv(dataset, reward_fn, config)
