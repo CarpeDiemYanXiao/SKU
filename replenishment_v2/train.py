@@ -5,8 +5,13 @@
 import os
 import sys
 import argparse
+import warnings
 from pathlib import Path
 from datetime import datetime
+
+# 过滤掉 torch_npu 的兼容性警告
+warnings.filterwarnings("ignore", message=".*AutoNonVariableTypeMode.*")
+warnings.filterwarnings("ignore", message=".*owner does not match.*")
 
 # 在导入 torch 之前，根据配置决定是否使用 NPU
 # 先加载配置检查设备设置
