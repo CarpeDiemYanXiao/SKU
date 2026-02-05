@@ -34,6 +34,14 @@ try:
 except ImportError:
     HAS_TENSORBOARD = False
 
+# NPU 支持 (华为昇腾)
+HAS_NPU = False
+try:
+    import torch_npu
+    HAS_NPU = torch.npu.is_available()
+except ImportError:
+    pass
+
 
 def train_episode(
     env,
@@ -183,9 +191,37 @@ def main():
         tb_dir.mkdir(parents=True, exist_ok=True)
         writer = SummaryWriter(log_dir=str(tb_dir))
     
-    # 设备
-    device = config["task"].get("device", "cpu")
-    print(f"[Train] Device: {device}")
+    # 设备 - 自动检测 NPU/CUDA 可用性
+    device_config = config["task"].get("device", "auto")
+    
+    if device_config == "auto":
+        # 自动选择：NPU > CUDA > CPU
+        if HAS_NPU:
+            device = "npu:0"
+            print(f"[Train] Device: {device} (NPU available)")
+        elif torch.cuda.is_available():
+            device = "cuda:0"
+            print(f"[Train] Device: {device} (CUDA available)")
+        else:
+            device = "cpu"
+            print(f"[Train] Device: {device}")
+    elif "npu" in device_config:
+        if HAS_NPU:
+            device = device_config
+            print(f"[Train] Device: {device} (NPU available)")
+        else:
+            device = "cpu"
+            print(f"[Train] Warning: NPU not available, using CPU instead")
+    elif "cuda" in device_config:
+        if torch.cuda.is_available():
+            device = device_config
+            print(f"[Train] Device: {device} (CUDA available)")
+        else:
+            device = "cpu"
+            print(f"[Train] Warning: CUDA not available, using CPU instead")
+    else:
+        device = device_config
+        print(f"[Train] Device: {device}")
     
     # 加载数据
     print("[Train] Loading dataset...")

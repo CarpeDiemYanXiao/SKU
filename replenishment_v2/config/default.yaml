@@ -4,7 +4,7 @@
 task:
   name: "replenishment_v2"
   seed: 42
-  device: "cuda:0"
+  device: "auto"  # auto: NPU > CUDA > CPU, 或指定 npu:0 / cuda:0 / cpu
 
 data:
   train_path: "../data/2000_sku.parquet"
