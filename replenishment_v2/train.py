@@ -7,6 +7,21 @@ import sys
 import argparse
 from pathlib import Path
 from datetime import datetime
+
+# 在导入 torch 之前，根据配置决定是否使用 NPU
+# 先加载配置检查设备设置
+_config_path = Path(__file__).parent / "config" / "default.yaml"
+_use_npu = True  # 默认尝试使用 NPU
+if _config_path.exists():
+    with open(_config_path, 'r', encoding='utf-8') as f:
+        import re
+        content = f.read()
+        match = re.search(r'device:\s*["\']?(\w+)', content)
+        if match and match.group(1).lower() == 'cpu':
+            _use_npu = False
+            # 设置环境变量禁用 NPU
+            os.environ['NPU_VISIBLE_DEVICES'] = ''
+
 import numpy as np
 import torch
 from tqdm import tqdm
@@ -34,13 +49,14 @@ try:
 except ImportError:
     HAS_TENSORBOARD = False
 
-# NPU 支持 (华为昇腾)
+# NPU 支持 (华为昇腾) - 仅在需要时加载
 HAS_NPU = False
-try:
-    import torch_npu
-    HAS_NPU = torch.npu.is_available()
-except ImportError:
-    pass
+if _use_npu:
+    try:
+        import torch_npu
+        HAS_NPU = torch.npu.is_available()
+    except ImportError:
+        pass
 
 
 def train_episode(
