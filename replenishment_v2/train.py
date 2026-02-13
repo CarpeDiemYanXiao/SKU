@@ -1,11 +1,21 @@
 """
-训练入口
+训练入口（增强版）
+参考 rl_0113/replenishment_abo 的优化实践
+
+新增功能:
+- 课程学习 (Curriculum Learning)
+- 完整的 Checkpoint 保存/加载
+- 状态/奖励在线归一化
+- 分布式训练支持
+- 更详细的训练日志
 """
 
 import os
 import sys
 import argparse
 import warnings
+import time
+import json
 from pathlib import Path
 from datetime import datetime
 
@@ -35,16 +45,19 @@ from tqdm import tqdm
 sys.path.insert(0, str(Path(__file__).parent))
 
 from src.dataset import ReplenishmentDataset
-from src.environment import create_env
-from src.agent import PPOAgent, RolloutBuffer
+from src.environment import create_env, create_env_with_reward
+from src.agent import PPOAgent
 from src.reward import create_reward
 from src.utils import (
     load_config, 
+    save_config,
     set_seed, 
     create_output_dir,
     EarlyStopping,
     MetricsTracker,
     format_metrics,
+    StateNormalizer,
+    RewardNormalizer,
 )
 
 # TensorBoard
@@ -64,19 +77,139 @@ if _use_npu:
         pass
 
 
+class RolloutBuffer:
+    """
+    Rollout Buffer（增强版）
+    存储 rollout 数据，支持多 episode 累积
+    """
+    
+    def __init__(self):
+        self.reset()
+        self._temp = {}  # 临时存储，用于批量处理
+    
+    def reset(self):
+        self.states = []
+        self.actions = []
+        self.rewards = []
+        self.dones = []
+        self.log_probs = []
+        self.values = []
+        self.sku_ids = []  # 追踪每条transition属于哪个SKU
+    
+    def add(
+        self,
+        state: np.ndarray,
+        action: int,
+        reward: float,
+        done: bool,
+        log_prob: float,
+        value: float,
+        sku_id: str = None,
+    ):
+        self.states.append(state)
+        self.actions.append(action)
+        self.rewards.append(reward)
+        self.dones.append(done)
+        self.log_probs.append(log_prob)
+        self.values.append(value)
+        self.sku_ids.append(sku_id)
+    
+    def get(self) -> dict:
+        return {
+            "states": np.array(self.states),
+            "actions": np.array(self.actions),
+            "rewards": np.array(self.rewards),
+            "dones": np.array(self.dones),
+            "old_log_probs": np.array(self.log_probs),
+            "values": np.array(self.values),
+            "sku_ids": self.sku_ids,
+        }
+    
+    def __len__(self):
+        return len(self.states)
+
+
+def compute_per_sku_gae(rollout_data: dict, gamma: float, gae_lambda: float) -> dict:
+    """
+    按SKU分段计算GAE（修复跨SKU GAE污染问题）
+    
+    原始实现将所有SKU的transition当做一条连续序列计算GAE，
+    导致SKU切换处的next_value错误地使用了其他SKU的value。
+    
+    正确做法：每个SKU独立计算GAE，再拼接。
+    参考rl_0113基线: refactor_agent.py 中也是按SKU分段计算。
+    """
+    from collections import defaultdict
+    
+    sku_ids = rollout_data["sku_ids"]
+    rewards = rollout_data["rewards"]
+    values = rollout_data["values"]
+    dones = rollout_data["dones"]
+    
+    n = len(rewards)
+    advantages = np.zeros(n, dtype=np.float32)
+    returns = np.zeros(n, dtype=np.float32)
+    
+    # 按SKU分组索引
+    sku_indices = defaultdict(list)
+    for i, sid in enumerate(sku_ids):
+        sku_indices[sid].append(i)
+    
+    # 每个SKU独立计算GAE
+    for sid, indices in sku_indices.items():
+        indices = sorted(indices)  # 确保时间顺序
+        n_sku = len(indices)
+        
+        gae = 0.0
+        for t in reversed(range(n_sku)):
+            idx = indices[t]
+            if t == n_sku - 1:
+                next_val = 0.0
+            else:
+                next_val = values[indices[t + 1]]
+            
+            delta = rewards[idx] + gamma * next_val * (1 - dones[idx]) - values[idx]
+            gae = delta + gamma * gae_lambda * (1 - dones[idx]) * gae
+            advantages[idx] = gae
+            returns[idx] = gae + values[idx]
+    
+    rollout_data["advantages"] = advantages
+    rollout_data["returns"] = returns
+    return rollout_data
+
+
 def train_episode(
     env,
     agent: PPOAgent,
     buffer: RolloutBuffer,
+    state_normalizer: StateNormalizer = None,
+    reward_normalizer: RewardNormalizer = None,
+    use_state_norm: bool = False,
+    use_reward_norm: bool = False,
+    use_terminal_reward: bool = True,  # 新增: 终止态奖励
 ) -> dict:
     """
-    训练一个 episode (批量优化版本)
+    训练一个 episode (批量优化版本，支持状态/奖励归一化)
+    
+    Args:
+        env: 训练环境
+        agent: PPO Agent
+        buffer: Rollout Buffer
+        state_normalizer: 状态归一化器
+        reward_normalizer: 奖励归一化器
+        use_state_norm: 是否使用状态归一化
+        use_reward_norm: 是否使用奖励归一化
+        use_terminal_reward: 是否使用终止态奖励 (DeepStock论文)
     
     Returns:
         episode 统计信息
     """
     # 注意：不在这里 reset buffer，让 buffer 可以累积多个 episode
     state_map = env.reset()
+    
+    # 重置奖励归一化器的累积回报
+    if reward_normalizer:
+        reward_normalizer.reset()
     
     sku_ids = list(state_map.keys())
     done_all = False
@@ -89,8 +222,14 @@ def train_episode(
         if not active_sku_ids:
             break
         
-        # 批量构建状态矩阵
-        states_batch = np.array([state_map[sku_id] for sku_id in active_sku_ids])
+        # 批量构建状态矩阵（可选归一化）
+        if use_state_norm and state_normalizer:
+            states_batch = np.array([
+                state_normalizer(state_map[sku_id], update=True) 
+                for sku_id in active_sku_ids
+            ])
+        else:
+            states_batch = np.array([state_map[sku_id] for sku_id in active_sku_ids])
         
         # 批量推理（一次 GPU 调用）
         actions_batch, log_probs_batch = agent.select_actions_batch(states_batch)
@@ -114,11 +253,15 @@ def train_episode(
         # 环境步进
         next_state_map, reward_map, done_map, info_map = env.step(action_map)
         
-        # 存储到 buffer
+        # 存储到 buffer（可选奖励归一化）
         for sku_id in action_map.keys():
             temp = buffer._temp[sku_id]
             reward = reward_map.get(sku_id, 0.0)
             done = done_map.get(sku_id, False)
+            
+            # 奖励归一化
+            if use_reward_norm and reward_normalizer:
+                reward = reward_normalizer(reward, update=True)
             
             buffer.add(
                 state=temp["state"],
@@ -127,15 +270,35 @@ def train_episode(
                 done=done,
                 log_prob=temp["log_prob"],
                 value=temp["value"],
+                sku_id=sku_id,
             )
             
-            episode_rewards[sku_id] += reward
+            episode_rewards[sku_id] += reward_map.get(sku_id, 0.0)  # 原始奖励用于统计
         
         # 更新状态
         state_map = next_state_map
         
         # 检查是否全部结束
         done_all = all(done_map.values())
+    
+    # ========== 终止态奖励 (DeepStock论文) ==========
+    # 在episode结束时根据累计指标给予大的奖惩
+    if use_terminal_reward and hasattr(env.reward_fn, 'compute_terminal_reward'):
+        terminal_reward = env.reward_fn.compute_terminal_reward()
+        
+        # 将终止态奖励分配给最后几个时间步
+        if len(buffer) > 0 and terminal_reward != 0:
+            # 找到最后N步（每个SKU的最后一步）
+            n_last_steps = min(len(sku_ids), len(buffer))
+            for i in range(n_last_steps):
+                idx = len(buffer.rewards) - 1 - i
+                if idx >= 0:
+                    # 终止态奖励按SKU数量均分
+                    buffer.rewards[idx] += terminal_reward / len(sku_ids)
+    
+    # 重置reward_fn的累计统计
+    if hasattr(env.reward_fn, 'reset'):
+        env.reward_fn.reset()
     
     # 获取环境指标
     env_metrics = env.get_metrics()
@@ -151,9 +314,17 @@ def train_episode(
 def evaluate(
     env,
     agent: PPOAgent,
+    state_normalizer: StateNormalizer = None,
+    use_state_norm: bool = False,
 ) -> dict:
     """
     评估模型
+    
+    Args:
+        env: 环境
+        agent: PPO Agent
+        state_normalizer: 状态归一化器
+        use_state_norm: 是否使用状态归一化
     """
     state_map = env.reset()
     sku_ids = list(state_map.keys())
@@ -167,6 +338,10 @@ def evaluate(
                 continue
             
             state = state_map[sku_id]
+            # 评估时使用归一化但不更新统计量
+            if use_state_norm and state_normalizer:
+                state = state_normalizer(state, update=False)
+            
             action, _ = agent.select_action(state, deterministic=True)
             action_map[sku_id] = action
         
@@ -178,11 +353,13 @@ def evaluate(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="库存补货 RL 训练")
+    parser = argparse.ArgumentParser(description="库存补货 RL 训练（增强版）")
     parser.add_argument("--config", type=str, default="config/default.yaml", help="配置文件路径")
     parser.add_argument("--data_path", type=str, default=None, help="训练数据路径 (覆盖配置)")
     parser.add_argument("--output_dir", type=str, default=None, help="输出目录 (覆盖配置)")
-    parser.add_argument("--resume", type=str, default=None, help="恢复训练的模型路径")
+    parser.add_argument("--resume", type=str, default=None, help="恢复训练的 checkpoint 路径")
+    parser.add_argument("--resume_mode", type=str, default="full", choices=["full", "weights"], 
+                        help="恢复模式: full=完全恢复, weights=只加载权重")
     args = parser.parse_args()
     
     # 加载配置
@@ -205,6 +382,9 @@ def main():
     
     print(f"[Train] Output directory: {output_dir}")
     
+    # 保存配置副本
+    save_config(config, str(output_dir / "config.yaml"))
+    
     # TensorBoard
     writer = None
     if HAS_TENSORBOARD and config["logging"].get("tensorboard", True):
@@ -216,7 +396,6 @@ def main():
     device_config = config["task"].get("device", "auto")
     
     if device_config == "auto":
-        # 自动选择：NPU > CUDA > CPU
         if HAS_NPU:
             device = "npu:0"
             print(f"[Train] Device: {device} (NPU available)")
@@ -256,30 +435,65 @@ def main():
     # 创建环境
     print("[Train] Creating environment...")
     reward_fn = create_reward(config)
-    env = create_env(dataset, config)
+    env = create_env_with_reward(dataset, config, reward_fn)
+    
+    # 计算 state_dim
+    n_dynamic = len(config["env"]["state_features"]["dynamic"])
+    n_static = len(config["env"]["state_features"]["static"])
+    state_dim = n_dynamic + n_static
+    
+    # 创建归一化器（参考 abo 项目）
+    train_cfg = config["training"]
+    use_state_norm = train_cfg.get("use_state_norm", False)
+    use_reward_norm = train_cfg.get("use_reward_norm", False)
+    norm_clip = train_cfg.get("norm_clip", 10.0)
+    
+    state_normalizer = None
+    reward_normalizer = None
+    
+    if use_state_norm:
+        state_normalizer = StateNormalizer(shape=(state_dim,), clip=norm_clip)
+        state_normalizer.set_sample_num(dataset.n_skus)
+        print(f"[Train] State normalization enabled (clip={norm_clip})")
+    
+    if use_reward_norm:
+        gamma = config["ppo"]["gamma"]
+        reward_normalizer = RewardNormalizer(clip=norm_clip, gamma=gamma)
+        reward_normalizer.set_sample_num(dataset.n_skus)
+        print(f"[Train] Reward normalization enabled (clip={norm_clip})")
     
     # 创建 Agent
     print("[Train] Creating agent...")
     agent = PPOAgent(config, device=device)
     
     # 恢复训练
+    start_episode = 1
     if args.resume:
-        agent.load(args.resume)
-        print(f"[Train] Resumed from {args.resume}")
+        checkpoint = agent.load(args.resume, mode=args.resume_mode)
+        if args.resume_mode == "full" and "episode" in checkpoint:
+            start_episode = checkpoint.get("episode", 1) + 1
+        # 恢复归一化器状态
+        if use_state_norm and "state_norm_state" in checkpoint:
+            state_normalizer.running_ms.load_state(checkpoint["state_norm_state"])
+        if use_reward_norm and "reward_norm_state" in checkpoint:
+            reward_normalizer.running_ms.load_state(checkpoint["reward_norm_state"])
+        print(f"[Train] Resumed from {args.resume}, starting at episode {start_episode}")
     
     # 训练配置
-    train_cfg = config["training"]
     max_episodes = train_cfg["max_episodes"]
     eval_interval = train_cfg["eval_interval"]
     save_interval = train_cfg["save_interval"]
     print_interval = config["logging"].get("print_interval", 5)
-    accumulate_episodes = train_cfg.get("accumulate_episodes", 1)  # NPU优化：累积多个episode
+    accumulate_episodes = train_cfg.get("accumulate_episodes", 1)
     
     # 课程学习
     curriculum_cfg = train_cfg.get("curriculum", {})
     use_curriculum = curriculum_cfg.get("enabled", False)
     curriculum_stages = curriculum_cfg.get("stages", [])
     current_stage_idx = 0
+    
+    if use_curriculum:
+        pass
     
     # 早停
     early_stopping = EarlyStopping(
@@ -291,26 +505,26 @@ def main():
     metrics_tracker = MetricsTracker()
     best_acc = 0.0
     best_rts = float('inf')
-    best_combined_score = -float('inf')  # ACC - RTS_penalty
+    best_combined_score = -float('inf')
     
     # Rollout buffer
     buffer = RolloutBuffer()
     
-    print(f"[Train] Starting training for {max_episodes} episodes...")
-    print(f"[Train] NPU optimization: accumulate {accumulate_episodes} episodes before update")
-    print("=" * 60)
+    print(f"[Train] {max_episodes} episodes, {dataset.n_skus} SKUs")
     
-    # 创建进度条 (每5轮更新一次)
+    # 创建进度条
     pbar = tqdm(
-        range(1, max_episodes + 1), 
+        range(start_episode, max_episodes + 1), 
         desc="Training", 
         miniters=5, 
         mininterval=1.0,
-        dynamic_ncols=True,  # 自适应终端宽度
+        dynamic_ncols=True,
         leave=True,
     )
     
     for episode in pbar:
+        episode_start_time = time.time()
+        
         # 课程学习: 更新 reward 权重
         if use_curriculum:
             for i, stage in enumerate(curriculum_stages):
@@ -318,27 +532,45 @@ def main():
                 if episode <= stage_end:
                     if i != current_stage_idx:
                         current_stage_idx = i
-                        tqdm.write(f"[Curriculum] Entering stage: {stage['name']}")
+                        pass  # stage transition
                         # 更新 reward 权重
                         if hasattr(reward_fn, 'rts_weight'):
                             reward_fn.rts_weight = stage.get("rts_weight", 1.0)
                         if hasattr(reward_fn, 'bind_weight'):
                             reward_fn.bind_weight = stage.get("bind_weight", 0.25)
+                        if hasattr(reward_fn, 'overnight_weight'):
+                            reward_fn.overnight_weight = stage.get("overnight_weight", 0.01)
+                        if hasattr(reward_fn, 'safe_stock_weight'):
+                            reward_fn.safe_stock_weight = stage.get("safe_stock_weight", 0.4)
                     break
         
-        # 训练一个 episode
-        episode_stats = train_episode(env, agent, buffer)
+        # 训练一个 episode（支持归一化）
+        # 终止态奖励配置
+        use_terminal_reward = train_cfg.get("use_terminal_reward", True)
         
-        # PPO 更新（累积多个episode后再更新，提高NPU利用率）
+        episode_stats = train_episode(
+            env, agent, buffer,
+            state_normalizer=state_normalizer,
+            reward_normalizer=reward_normalizer,
+            use_state_norm=use_state_norm,
+            use_reward_norm=use_reward_norm,
+            use_terminal_reward=use_terminal_reward,
+        )
+        
+        # PPO 更新
+        train_stats = {"policy_loss": 0, "value_loss": 0, "entropy": 0}
         if len(buffer) > 0 and episode % accumulate_episodes == 0:
             rollout_data = buffer.get()
-            train_stats = agent.update(rollout_data)
-            buffer.reset()  # 更新后清空buffer
-        else:
-            train_stats = {"policy_loss": 0, "value_loss": 0, "entropy": 0}
+            # 按SKU分段计算GAE（修复跨SKU GAE污染）
+            rollout_data = compute_per_sku_gae(
+                rollout_data, agent.gamma, agent.gae_lambda)
+            train_stats = agent.update(rollout_data, writer=writer)
+            buffer.reset()
+        
+        episode_time = time.time() - episode_start_time
         
         # 记录指标
-        all_stats = {**episode_stats, **train_stats}
+        all_stats = {**episode_stats, **train_stats, "episode_time": episode_time}
         metrics_tracker.add(all_stats, episode)
         
         if writer:
@@ -347,42 +579,32 @@ def main():
         
         # 打印进度
         if episode % print_interval == 0:
-            # 更新进度条后缀信息（简化显示）
             pbar.set_postfix_str(
-                f"ACC={episode_stats['acc']:.1f}% RTS={episode_stats['rts_rate']:.1f}% R={episode_stats['mean_reward']:.1f}"
+                f"ACC={episode_stats['acc']:.1f}% RTS={episode_stats['rts_rate']:.1f}%"
             )
         
         # 评估
         if episode % eval_interval == 0:
-            eval_metrics = evaluate(env, agent)
+            eval_metrics = evaluate(env, agent, state_normalizer, use_state_norm)
             
-            # 暂停进度条输出评估信息
-            tqdm.write(f"[Eval Episode {episode}] ACC={eval_metrics['acc']:.2f}% | RTS={eval_metrics['rts_rate']:.2f}%")
+            tqdm.write(f"ACC={eval_metrics['acc']:.2f}% | RTS={eval_metrics['rts_rate']:.2f}%")
             
             if writer:
                 writer.add_scalar("eval/acc", eval_metrics["acc"], episode)
                 writer.add_scalar("eval/rts_rate", eval_metrics["rts_rate"], episode)
             
-            # ========== 核心: 模型选择逻辑 ==========
-            # 目标: RTS≤2.4% 且 ACC≥80%
-            # 策略: 优先找满足RTS约束的，然后在其中选ACC最高的
+            # 模型选择逻辑
             target_rts = train_cfg.get("target_rts", 2.4)
             target_acc = train_cfg.get("target_acc", 80.0)
             
             current_rts = eval_metrics["rts_rate"]
             current_acc = eval_metrics["acc"]
             
-            # 计算综合得分
-            # 如果RTS达标: score = ACC + bonus
-            # 如果RTS不达标: score = ACC - heavy_penalty
             if current_rts <= target_rts:
-                # RTS达标，ACC越高越好
-                rts_bonus = 10.0  # 达标奖励
+                rts_bonus = 10.0
                 combined_score = current_acc + rts_bonus
             else:
-                # RTS超标，根据超出程度惩罚
                 rts_excess = current_rts - target_rts
-                # 超出越多惩罚越重，但不要太重导致模型不敢补货
                 rts_penalty = rts_excess * 3.0
                 combined_score = current_acc - rts_penalty
             
@@ -391,22 +613,54 @@ def main():
                 best_combined_score = combined_score
                 best_acc = eval_metrics["acc"]
                 best_rts = eval_metrics["rts_rate"]
-                agent.save(str(output_dir / "best_model.pth"))
-                status = "✓" if current_rts <= target_rts else "×"
-                tqdm.write(f"  -> New best! ACC={best_acc:.2f}%, RTS={best_rts:.2f}% [{status}]")
+                
+                # 保存完整 checkpoint
+                extra_info = {
+                    "episode": episode,
+                    "best_acc": best_acc,
+                    "best_rts": best_rts,
+                    "best_combined_score": best_combined_score,
+                }
+                if use_state_norm:
+                    extra_info["state_norm_state"] = state_normalizer.running_ms.save_state()
+                if use_reward_norm:
+                    extra_info["reward_norm_state"] = reward_normalizer.running_ms.save_state()
+                
+                agent.save(str(output_dir / "best_model.pth"), extra_info=extra_info)
+                tqdm.write(f"  -> Best: ACC={best_acc:.2f}% RTS={best_rts:.2f}%")
             
             # 早停检查
             if early_stopping(combined_score):
-                tqdm.write(f"[Train] Early stopping at episode {episode}")
+                tqdm.write(f"Early stop at ep {episode}")
                 pbar.close()
                 break
         
-        # 定期保存
+        # 定期保存 checkpoint
         if episode % save_interval == 0:
-            agent.save(str(output_dir / f"model_ep{episode}.pth"))
+            extra_info = {
+                "episode": episode,
+                "best_acc": best_acc,
+                "best_rts": best_rts,
+            }
+            if use_state_norm:
+                extra_info["state_norm_state"] = state_normalizer.running_ms.save_state()
+            if use_reward_norm:
+                extra_info["reward_norm_state"] = reward_normalizer.running_ms.save_state()
+            
+            agent.save(str(output_dir / f"model_ep{episode}.pth"), extra_info=extra_info)
     
     # 保存最终模型
-    agent.save(str(output_dir / "final_model.pth"))
+    extra_info = {
+        "episode": episode,
+        "best_acc": best_acc,
+        "best_rts": best_rts,
+    }
+    if use_state_norm:
+        extra_info["state_norm_state"] = state_normalizer.running_ms.save_state()
+    if use_reward_norm:
+        extra_info["reward_norm_state"] = reward_normalizer.running_ms.save_state()
+    
+    agent.save(str(output_dir / "final_model.pth"), extra_info=extra_info)
     
     print("=" * 60)
     print(f"[Train] Training completed!")

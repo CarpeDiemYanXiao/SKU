@@ -67,6 +67,9 @@ class InventorySimulator:
         replenish_qty: float,
         actual_sales: float,
         leadtime: int,
+        avg_sales: float,
+        pred_y: float,
+        predicts: List[float],
     ) -> Tuple[SKUState, Dict[str, float]]:
         """
         执行一天的模拟
@@ -166,7 +169,9 @@ class InventorySimulator:
         # ========== 6. 预估RTS (关键优化!) ==========
         # 参考rl_0113: 预估到货后未来14天卖不掉的量
         # 这让模型能在补货时就预见到RTS风险
-        info["estimate_rts"] = self._estimate_future_rts(state, replenish_qty, leadtime)
+        info["estimate_rts"] = self._estimate_future_rts(
+            state, replenish_qty, leadtime, avg_sales, pred_y, predicts
+        )
         
         # 更新天数
         state.day_idx += 1
@@ -178,35 +183,45 @@ class InventorySimulator:
         state: SKUState, 
         replenish_qty: float, 
         leadtime: int,
+        avg_sales: float,
+        pred_y: float,
+        predicts: List[float],
     ) -> float:
         """
-        预估当前补货在未来可能产生的RTS
+        预估当前补货可能导致的RTS量
         
-        逻辑: 补货到货后，根据库存年龄队列估算有多少会在14天后过期
-        这是一个前瞻性的惩罚信号，让模型在补货时就考虑RTS风险
+        两个来源:
+        1. 现有库存中即将过期的部分
+        2. 补货导致的过量库存（供过于求）
+        
+        注意: 调用时 replenish_qty 已经加入了 transit_stock，
+        所以滚动模拟只需用 current_stock + transit_stock，无需再加 replenish_qty。
         """
-        if replenish_qty <= 0:
-            return 0.0
-        
-        # 当前库存中快过期的部分
-        current_near_expire = 0.0
+        # 1. 现有库存中快过期部分
+        near_expire = 0.0
         current_day = state.day_idx
-        
         for (entry_day, qty) in state.stock_age_queue:
-            age = current_day - entry_day
-            # 这批货在补货到货时(+leadtime天)的年龄
-            future_age = age + leadtime
-            # 如果到货时这批货只剩不到7天就过期，很可能变成RTS
-            remaining_days = self.rts_days - future_age
-            if remaining_days <= 7 and remaining_days > 0:
-                # 剩余天数越少，变成RTS的概率越高
-                rts_prob = 1.0 - (remaining_days / 7.0)
-                current_near_expire += qty * rts_prob
+            remaining = self.rts_days - (current_day - entry_day)
+            if 0 < remaining <= 5:
+                near_expire += qty * (1.0 - remaining / 5.0)
         
-        # 补货量本身的RTS风险：如果补得太多
-        # 假设预估日销量 = 历史平均 (简化，实际应从state获取)
-        # 这里返回预估值，让reward函数使用
-        return current_near_expire
+        if replenish_qty <= 0:
+            return near_expire
+        
+        # 2. 滚动模拟估算过量风险（transit_stock 已包含本次补货）
+        daily_demand = max(0.5 * max(pred_y, 0) + 0.5 * max(avg_sales, 0), 0.1)
+        rolling = state.current_stock
+        
+        for d in range(self.rts_days):
+            # 在途到货
+            if d < len(state.transit_stock):
+                rolling += state.transit_stock[d]
+            # 每日消耗
+            pred = predicts[d] if d < len(predicts) else daily_demand
+            rolling = max(0, rolling - max(pred, 0))
+        
+        # rolling 为 rts_days 后的剩余库存，即潜在RTS
+        return near_expire + max(0, rolling) * 0.3
     
     def get_transit_stock(self, state: SKUState) -> List[float]:
         """获取在途库存列表"""

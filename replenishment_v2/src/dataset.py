@@ -117,8 +117,38 @@ class ReplenishmentDataset:
         else:
             self.demand_freq_map = None
         
+        self._build_demand_calibration(df, grouped)
+        
         print(f"[Dataset] Loaded {self.n_skus} SKUs, {len(df)} records")
     
+    def _build_demand_calibration(self, df, grouped):
+        self._calib_map = {}
+        alpha = 0.2
+        for sku_id in self.sku_ids:
+            n_days = self.n_days_map[sku_id]
+            preds_arr = self.predicts_map[sku_id]
+            seq = self.sales_map[sku_id]
+            factors = []
+            for d in range(n_days):
+                pred = preds_arr[d]
+                horizon = min(len(pred), n_days - d)
+                p_val = sum(max(0, float(v)) for v in pred[:horizon])
+                s_val = sum(max(0, seq[d + i]) for i in range(horizon))
+                if p_val > 0.5:
+                    w = alpha * (s_val / p_val) + (1 - alpha)
+                else:
+                    w = 1.0
+                factors.append(max(0.5, min(w, 2.0)))
+            self._calib_map[sku_id] = factors
+
+    def get_demand_factor(self, sku_id: str, day_idx: int) -> float:
+        if sku_id not in self._calib_map:
+            return 1.0
+        fl = self._calib_map[sku_id]
+        if day_idx < len(fl):
+            return fl[day_idx]
+        return fl[-1] if fl else 1.0
+
     def get_sku_data(self, sku_id: str) -> Dict:
         """获取单个 SKU 的所有数据"""
         return {
@@ -175,6 +205,19 @@ class ReplenishmentDataset:
         if self.avg_qty_7d_map is None:
             return 1.0
         return self.avg_qty_7d_map[sku_id][day_idx]
+    
+    def get_feature_by_name(self, sku_id: str, day_idx: int, feature_name: str) -> float:
+        """按特征名获取单个静态特征值（避免展平后索引错位）"""
+        if feature_name not in self.static_features:
+            return 0.0
+        feat_idx = self.static_features.index(feature_name)
+        row = self.static_features_map[sku_id][day_idx]
+        if feat_idx < len(row):
+            val = row[feat_idx]
+            if isinstance(val, (list, tuple, np.ndarray)):
+                return float(val[0]) if len(val) > 0 else 0.0
+            return float(val)
+        return 0.0
 
 
 def create_dataset(config: dict, split: str = "train") -> ReplenishmentDataset:

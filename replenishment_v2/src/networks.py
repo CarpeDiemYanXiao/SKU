@@ -200,8 +200,13 @@ class PolicyNetworkDiscrete(nn.Module):
 
 class PolicyNetworkContinuous(nn.Module):
     """
-    连续动作策略网络
+    连续动作策略网络（增强版）
     输出高斯分布的均值和标准差
+    
+    增强功能:
+    - 更好的权重初始化（正交初始化）
+    - std 范围动态调整
+    - LayerNorm 处理不同量纲的输入
     """
     
     def __init__(
@@ -212,7 +217,7 @@ class PolicyNetworkContinuous(nn.Module):
         action_min: float = 0.8,
         action_max: float = 3.0,
         std_min: float = 0.1,
-        std_max: float = 0.5,
+        std_max: float = None,  # None 时自动设为 (action_max - action_min) * 0.1
         use_layer_norm: bool = True,
         use_residual: bool = True,
         dropout: float = 0.0,
@@ -225,7 +230,8 @@ class PolicyNetworkContinuous(nn.Module):
         self.action_min = action_min
         self.action_max = action_max
         self.std_min = std_min
-        self.std_max = std_max
+        # 标准差上限与动作范围成比例
+        self.std_max = std_max if std_max else (action_max - action_min) * 0.15
         
         # 特征提取器
         self.feature_extractor = FeatureExtractor(
@@ -243,11 +249,19 @@ class PolicyNetworkContinuous(nn.Module):
         # 标准差头
         self.std_head = nn.Linear(hidden_dims[-1], action_dim)
         
-        # 初始化
+        # 正交初始化（参考 abo 项目）
+        self._init_weights()
+    
+    def _init_weights(self):
+        """正交初始化，有助于 RL 训练稳定性"""
+        # 输出层使用较小的初始化
         nn.init.orthogonal_(self.mu_head.weight, gain=0.01)
-        nn.init.zeros_(self.mu_head.bias)
+        # 库存天数模式：初始输出约为中间值
+        # action_range [0,10], 目标初始值 3-4天
+        nn.init.zeros_(self.mu_head.bias)  # sigmoid(0)=0.5 -> 中间值
+        
         nn.init.orthogonal_(self.std_head.weight, gain=0.01)
-        nn.init.zeros_(self.std_head.bias)
+        nn.init.constant_(self.std_head.bias, -1.0)  # 适度探索
     
     def forward(self, state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -372,14 +386,28 @@ def create_networks(config: dict) -> Tuple[nn.Module, nn.Module]:
     
     # 创建策略网络
     if action_cfg["type"] == "discrete":
-        multiplier_range = action_cfg["multiplier_range"]
-        multiplier_step = action_cfg["multiplier_step"]
-        action_list = np.arange(
-            multiplier_range[0], 
-            multiplier_range[1] + multiplier_step, 
-            multiplier_step
-        ).round(2).tolist()
-        action_dim = len(action_list)
+        action_mode = action_cfg.get("action_mode", "multiplier")
+        
+        if action_mode == "stock_days":
+            # 库存天数模式（支持float步长）
+            stock_days_range = action_cfg.get("stock_days_range", [0, 10])
+            step = action_cfg.get("stock_days_step", 1)
+            action_list = np.arange(
+                stock_days_range[0],
+                stock_days_range[1] + step * 0.5,
+                step
+            ).round(2).tolist()
+            action_dim = len(action_list)
+        else:
+            # 乘数模式
+            multiplier_range = action_cfg["multiplier_range"]
+            multiplier_step = action_cfg["multiplier_step"]
+            action_list = np.arange(
+                multiplier_range[0], 
+                multiplier_range[1] + multiplier_step, 
+                multiplier_step
+            ).round(2).tolist()
+            action_dim = len(action_list)
         
         policy_network = PolicyNetworkDiscrete(
             state_dim=state_dim,

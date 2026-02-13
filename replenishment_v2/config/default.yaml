@@ -1,10 +1,15 @@
-# 电商库存补货 RL 配置文件
+# 电商库存补货 RL 配置文件（v3 - 参考rl_0113基线优化）
 # 目标: RTS≤2.4%, ACC≥80%
+# 核心改进:
+#   1. 添加 lt_begin_stock/lt_demand 关键状态特征（基线最重要的设计）
+#   2. 奖励重写为基线验证过的 bind + estimate_rts + safe_stock 设计
+#   3. PPO超参数对齐基线（k_epochs=4, grad_norm=1.0）
+#   4. 使用更细的 stock_days 步长（0.5）增加动作分辨率
 
 task:
   name: "replenishment_v2"
   seed: 42
-  device: "auto"  # auto: NPU > CUDA > CPU, 或指定 npu:0 / cuda:0 / cpu
+  device: "auto"
 
 data:
   train_path: "../data/2000_sku.parquet"
@@ -22,10 +27,11 @@ env:
       - "transit_day_4"
       - "transit_day_5"
       - "total_transit"
+      - "lt_begin_stock"        # 新增：前向模拟到货时库存（最关键的基线特征）
+      - "lt_demand"             # 新增：到货日预测需求
       - "stock_health"
       - "days_of_stock"
       - "near_expire_ratio"
-      - "avg_stock_age"
     static:
       - "leadtime"
       - "pred_y"
@@ -39,28 +45,40 @@ env:
       - "trend_item_qty_l3d_minus_l7d"
       - "trend_item_qty_l3d_minus_l14d"
 
-# ============ 动作配置 (核心优化) ============
+# ============ 动作配置 ============
 action:
   type: "discrete"
-  # 关键修改: 允许补货1.5倍预测量，保证ACC
-  multiplier_range: [0.5, 1.5]
+  policy_regularization: "none"
+  # stock_days 模式: 输出目标库存天数
+  action_mode: "stock_days"
+  stock_days_range: [0, 7]       # 扩大到7天
+  stock_days_step: 0.5           # 更细粒度 → 15个动作
+  max_replenish_days: 7
+  # 备用乘数配置
+  multiplier_range: [0.3, 0.8]
   multiplier_step: 0.1
+  target_stock_multiplier_range: [0, 4]
+  target_stock_step: 1
 
-# ============ 奖励配置 (核心优化) ============
+# ============ 奖励配置（参考基线 with_safe_stock）============
 reward:
   type: "balanced"
   weights:
-    sell_ratio: 3.0       # 销售达成率奖励 (大幅提高!)
-    rts_penalty: 1.0      # RTS惩罚 (降低，让模型敢补货)
-    overstock_penalty: 0.2  # 库存过多惩罚 (降低)
+    bind: 0.3
+    rts: 0.45
+    overnight: 0.005
+    safe_stock: 0.5
+    stockout: 0.6
   targets:
-    max_rts_rate: 0.024
-  normalize: true
-  clip_range: [-5, 5]
+    safe_stock_standard: 1.2
+    head_sku_threshold: 0.3
+  use_terminal_reward: false     # 禁用终止态奖励，依赖逐步信号
+  normalize: false
+  clip_range: [-10, 10]
 
-# ============ 网络配置 ============
+# ============ 网络配置（简化，匹配基线复杂度）============
 network:
-  hidden_dims: [256, 128, 64]
+  hidden_dims: [128, 128]        # 简化网络（基线为128）
   activation: "relu"
   use_layer_norm: true
   use_residual: false
@@ -68,33 +86,62 @@ network:
   init_method: "orthogonal"
   init_gain: 1.0
 
-# ============ PPO 配置 ============
+# ============ PPO 配置（对齐基线超参数）============
 ppo:
   gamma: 0.99
   gae_lambda: 0.95
   clip_epsilon: 0.2
-  entropy_coef: 0.02      # 增加探索
+  entropy_coef: 0.015            # 适度探索（15个动作空间）
   value_loss_coef: 0.5
-  max_grad_norm: 0.5
+  max_grad_norm: 1.0             # 基线=1.0（之前0.5太保守）
   lr_actor: 0.0003
   lr_critic: 0.0003
   weight_decay: 0.0
-  k_epochs: 10            # 增加更新轮数，充分利用 NPU
-  batch_size: 4096        # 增大批量，提高 NPU 利用率
-  mini_batch_size: 512    # mini-batch 大小
+  k_epochs: 4                   # 基线=3，折中取4
+  batch_size: 2048               # 减小以加速更新
+  mini_batch_size: 512
   normalize_advantages: true
+  advantage_clip: 5.0
+  log_ratio_clip: 20.0
+  diagnose_interval: 50
+  use_lr_scheduler: true
+  lr_decay_step: 80
+  lr_decay_gamma: 0.95
 
 # ============ 训练配置 ============
 training:
-  max_episodes: 600
+  max_episodes: 300
   eval_interval: 10
   save_interval: 50
-  early_stop_patience: 150
+  early_stop_patience: 50
   target_rts: 2.4
   target_acc: 80.0
-  accumulate_episodes: 2  # 累积多个 episode 再更新，增大有效 batch
+  accumulate_episodes: 1         # 每个episode更新一次（基线风格）
+  use_terminal_reward: false
+  use_state_norm: true
+  use_reward_norm: true          # 启用奖励归一化（处理不同SKU的规模差异）
+  norm_clip: 10.0
   curriculum:
-    enabled: false
+    enabled: true
+    stages:
+      - name: "warmup_bind"
+        episodes: 50
+        rts_weight: 0.35
+        bind_weight: 0.3
+        overnight_weight: 0.005
+        safe_stock_weight: 0.4
+      - name: "balance"
+        episodes: 100
+        rts_weight: 0.45
+        bind_weight: 0.3
+        overnight_weight: 0.005
+        safe_stock_weight: 0.5
+      - name: "acc_focus"
+        episodes: 150
+        rts_weight: 0.45
+        bind_weight: 0.3
+        overnight_weight: 0.005
+        safe_stock_weight: 0.5
 
 logging:
   log_dir: "output"

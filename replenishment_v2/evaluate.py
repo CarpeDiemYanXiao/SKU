@@ -18,12 +18,13 @@ from src.dataset import ReplenishmentDataset
 from src.environment import create_env
 from src.agent import PPOAgent
 from src.reward import create_reward
-from src.utils import load_config, set_seed
+from src.utils import load_config, set_seed, StateNormalizer
 
 
 def evaluate_model(
     env,
     agent: PPOAgent,
+    state_normalizer=None,
     verbose: bool = True,
 ) -> dict:
     """
@@ -47,6 +48,8 @@ def evaluate_model(
                 continue
             
             state = state_map[sku_id]
+            if state_normalizer is not None:
+                state = state_normalizer(state, update=False)
             action, _ = agent.select_action(state, deterministic=True)
             action_map[sku_id] = action
         
@@ -145,11 +148,20 @@ def main():
     # 加载模型
     print(f"[Eval] Loading model from {args.model_path}...")
     agent = PPOAgent(config, device=device)
-    agent.load(args.model_path)
+    checkpoint = agent.load(args.model_path)
+    
+    # 加载状态归一化器（训练时保存在 checkpoint 中）
+    state_normalizer = None
+    norm_clip = config.get("training", {}).get("norm_clip", 10.0)
+    if checkpoint and "state_norm_state" in checkpoint:
+        state_normalizer = StateNormalizer(
+            shape=(env.state_dim,), clip=norm_clip, update=False)
+        state_normalizer.running_ms.load_state(checkpoint["state_norm_state"])
+        print("[Eval] State normalizer loaded from checkpoint")
     
     # 评估
     print("[Eval] Running evaluation...")
-    results = evaluate_model(env, agent, verbose=args.verbose)
+    results = evaluate_model(env, agent, state_normalizer=state_normalizer, verbose=args.verbose)
     
     # 打印结果
     global_metrics = results["global"]

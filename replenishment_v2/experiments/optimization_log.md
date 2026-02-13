@@ -28,6 +28,25 @@ ppo: lr=3e-4, k_epochs=5, batch=2048
 
 ---
 
+### Exp-002: 约束型奖励 + 需求更平衡补货
+**日期**: 2026-02-08
+
+**改动**:
+1. BalancedReward 引入 Lagrange 约束（RTS 目标自动调节）
+2. 使用预估RTS与过库存惩罚（基于库存天数）
+3. stock_days 补货：引入 leadtime buffer，放宽单次补货上限
+4. 修复训练中 Reward 实例不一致导致的课程学习失效问题
+
+**配置**:
+```yaml
+action: stock_days [0,6], max_replenish_days=6
+reward: balanced + lagrange + estimate_rts_penalty
+```
+
+**结果**: 待测试
+
+---
+
 ### 优化方向规划
 
 #### 1. Reward Engineering (高优先级)

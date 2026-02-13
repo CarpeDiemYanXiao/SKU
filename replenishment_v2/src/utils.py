@@ -199,3 +199,222 @@ def format_metrics(metrics: Dict[str, float]) -> str:
         else:
             parts.append(f"{key}={value}")
     return " | ".join(parts)
+
+
+# ==============================================================================
+# 高级归一化模块（参考 rl_0113/replenishment_abo）
+# ==============================================================================
+
+class OnlineRunningMeanStd:
+    """
+    在线计算均值和标准差（支持分布式同步）
+    使用 Welford 算法实现增量更新
+    """
+    
+    def __init__(self, shape: tuple, epsilon: float = 1e-8):
+        self.n = 0
+        self.mean = np.zeros(shape, dtype=np.float64)
+        self.S = np.ones(shape, dtype=np.float64)  # 方差的累积和
+        self.std = np.sqrt(self.S)
+        self.epsilon = epsilon
+        self.sample_num = 0  # 用于分布式同步
+    
+    def set_sample_num(self, sample_num: int):
+        """设置样本数（用于分布式同步）"""
+        self.sample_num = sample_num
+    
+    def update(self, x: np.ndarray):
+        """增量更新统计量"""
+        x = np.array(x, dtype=np.float64)
+        self.n += 1
+        if self.n == 1:
+            self.mean = x.copy()
+            self.std = np.abs(x) + self.epsilon
+        else:
+            old_mean = self.mean.copy()
+            self.mean = old_mean + (x - old_mean) / self.n
+            self.S = self.S + (x - old_mean) * (x - self.mean)
+            self.std = np.sqrt(self.S / self.n) + self.epsilon
+    
+    def update_batch(self, batch: np.ndarray):
+        """批量更新统计量"""
+        batch_mean = np.mean(batch, axis=0, dtype=np.float64)
+        batch_var = np.var(batch, axis=0, dtype=np.float64)
+        batch_count = batch.shape[0]
+        self._update_from_moments(batch_mean, batch_var, batch_count)
+    
+    def _update_from_moments(self, batch_mean, batch_var, batch_count):
+        """通过矩更新（Welford 并行算法）"""
+        if self.n == 0:
+            self.mean = batch_mean
+            self.S = batch_var * batch_count
+            self.n = batch_count
+        else:
+            delta = batch_mean - self.mean
+            total_count = self.n + batch_count
+            self.mean = self.mean + delta * batch_count / total_count
+            m_a = self.S
+            m_b = batch_var * batch_count
+            self.S = m_a + m_b + np.square(delta) * self.n * batch_count / total_count
+            self.n = total_count
+        self.std = np.sqrt(self.S / self.n) + self.epsilon
+    
+    def normalize(self, x: np.ndarray) -> np.ndarray:
+        """归一化"""
+        return (x - self.mean) / (self.std + self.epsilon)
+    
+    def sync_distributed(self, distributed: bool = False, world_size: int = 1):
+        """分布式同步均值和标准差"""
+        if not distributed or world_size <= 1:
+            return
+        
+        try:
+            import torch.distributed as dist
+            import torch
+            
+            # 将统计量收集到所有进程
+            norm_dict = {
+                "mean": torch.tensor(self.mean),
+                "std": torch.tensor(self.std),
+                "num": self.sample_num
+            }
+            norm_list = [None] * world_size
+            dist.all_gather_object(norm_list, norm_dict)
+            
+            # 过滤有效数据并聚合
+            norm_list = [i for i in norm_list if i is not None and i["num"] > 0]
+            if len(norm_list) == 0:
+                return
+            
+            nums_all = sum([i["num"] for i in norm_list])
+            self.mean = np.sum([np.array(i["mean"] * i["num"]) for i in norm_list], axis=0) / nums_all
+            
+            # 计算合并方差
+            var_weighted = np.sum(
+                [(np.array(i["mean"])**2 + np.array(i["std"])**2) * i["num"] for i in norm_list],
+                axis=0
+            ) / nums_all - self.mean**2
+            self.std = np.sqrt(np.maximum(var_weighted, 0)) + self.epsilon
+            
+        except ImportError:
+            pass  # 非分布式环境
+    
+    def save_state(self) -> Dict:
+        """保存状态"""
+        return {
+            "n": self.n,
+            "mean": self.mean.tolist(),
+            "S": self.S.tolist(),
+            "std": self.std.tolist(),
+        }
+    
+    def load_state(self, state: Dict):
+        """加载状态"""
+        self.n = state["n"]
+        self.mean = np.array(state["mean"])
+        self.S = np.array(state["S"])
+        self.std = np.array(state["std"])
+
+
+class StateNormalizer:
+    """
+    状态归一化器
+    支持在线更新和分布式同步
+    """
+    
+    def __init__(self, shape: tuple, clip: float = 10.0, update: bool = True):
+        self.running_ms = OnlineRunningMeanStd(shape)
+        self.clip = clip
+        self.update_enabled = update
+    
+    def __call__(self, x: np.ndarray, update: bool = None) -> np.ndarray:
+        """
+        归一化状态
+        
+        Args:
+            x: 输入状态
+            update: 是否更新统计量（None 时使用默认设置）
+        """
+        if update is None:
+            update = self.update_enabled
+        
+        if update:
+            self.running_ms.update(x)
+        
+        normalized = (x - self.running_ms.mean) / (self.running_ms.std + 1e-8)
+        
+        if self.clip > 0:
+            normalized = np.clip(normalized, -self.clip, self.clip)
+        
+        return normalized.astype(np.float32)
+    
+    def set_sample_num(self, n: int):
+        self.running_ms.set_sample_num(n)
+    
+    def sync(self, distributed: bool = False, world_size: int = 1):
+        self.running_ms.sync_distributed(distributed, world_size)
+
+
+class RewardNormalizer:
+    """
+    奖励归一化器
+    只除以标准差，不减均值（保持奖励符号）
+    """
+    
+    def __init__(self, clip: float = 10.0, gamma: float = 0.99):
+        self.running_ms = OnlineRunningMeanStd(shape=(1,))
+        self.clip = clip
+        self.gamma = gamma
+        self.R = 0.0  # 折扣回报累积
+    
+    def __call__(self, reward: float, update: bool = True) -> float:
+        """归一化奖励"""
+        self.R = self.gamma * self.R + reward
+        
+        if update:
+            self.running_ms.update(np.array([self.R]))
+        
+        # 只除以标准差
+        normalized = reward / (self.running_ms.std[0] + 1e-8)
+        
+        if self.clip > 0:
+            normalized = np.clip(normalized, -self.clip, self.clip)
+        
+        return float(normalized)
+    
+    def reset(self):
+        """Episode 结束时重置累积回报"""
+        self.R = 0.0
+    
+    def set_sample_num(self, n: int):
+        self.running_ms.set_sample_num(n)
+    
+    def sync(self, distributed: bool = False, world_size: int = 1):
+        self.running_ms.sync_distributed(distributed, world_size)
+
+
+class AdvantageScaler:
+    """
+    优势值标准化和裁剪
+    """
+    
+    @staticmethod
+    def normalize(advantages: np.ndarray, clip: float = 5.0) -> np.ndarray:
+        """标准化并裁剪优势值"""
+        mean = advantages.mean()
+        std = advantages.std() + 1e-8
+        normalized = (advantages - mean) / std
+        if clip > 0:
+            normalized = np.clip(normalized, -clip, clip)
+        return normalized
+    
+    @staticmethod
+    def normalize_torch(advantages, clip: float = 5.0):
+        """PyTorch 版本"""
+        import torch
+        mean = advantages.mean()
+        std = advantages.std() + 1e-8
+        normalized = (advantages - mean) / std
+        if clip > 0:
+            normalized = torch.clamp(normalized, -clip, clip)
+        return normalized

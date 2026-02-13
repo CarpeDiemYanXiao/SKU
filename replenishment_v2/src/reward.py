@@ -348,93 +348,115 @@ class AdaptiveReward(BaseReward):
 
 class BalancedReward(BaseReward):
     """
-    平衡型 Reward 设计
+    Balanced Reward — 参考 rl_0113 基线验证过的奖励设计
     
-    核心思路: 直接优化 ACC 和 RTS 的平衡
-    - 销售奖励: 卖出去就给奖励 (鼓励补货)
-    - 缺货惩罚: 缺货就惩罚 (鼓励补货)
-    - RTS惩罚: 发生RTS时惩罚
+    核心思想（已验证有效）：
+    1. bind奖励：到货即售的量（正向激励适度补货）
+    2. 预估RTS惩罚：前瞻性RTS估计（让agent在补货时就考虑退货风险）
+    3. 过夜惩罚：持有成本
+    4. 安全库存缺口惩罚：头部SKU库存不足时惩罚（推动ACC提升的关键）
+    5. 缺货惩罚：头部SKU缺货时惩罚
+    
+    通过区分头部/尾部SKU精准投放补货：
+    - 头部SKU（高频需求 order_ratio_7d≥阈值）：加强补货保ACC
+    - 尾部SKU（低频需求）：保守补货控RTS
     """
     
     def __init__(
         self,
-        sell_ratio_weight: float = 3.0,
-        rts_weight: float = 1.0,
-        overstock_weight: float = 0.2,
-        max_rts_rate: float = 0.024,
-        normalize: bool = True,
-        clip_range: tuple = (-5, 5),
+        bind_weight: float = 0.18,
+        rts_weight: float = 0.8,
+        overnight_weight: float = 0.01,
+        safe_stock_weight: float = 0.4,
+        stockout_weight: float = 0.3,
+        safe_stock_standard: float = 0.6,
+        head_sku_threshold: float = 0.8,
+        normalize: bool = False,
+        clip_range: tuple = (-10, 10),
     ):
-        self.sell_ratio_weight = sell_ratio_weight
+        self.bind_weight = bind_weight
         self.rts_weight = rts_weight
-        self.overstock_weight = overstock_weight
-        self.max_rts_rate = max_rts_rate
+        self.overnight_weight = overnight_weight
+        self.safe_stock_weight = safe_stock_weight
+        self.stockout_weight = stockout_weight
+        self.safe_stock_standard = safe_stock_standard
+        self.head_sku_threshold = head_sku_threshold
         self.normalize = normalize
         self.clip_range = clip_range
         
         self._components = {}
         self._total_rts = 0.0
         self._total_replenish = 0.0
+        self._total_sold = 0.0
+        self._total_stockout = 0.0
     
     def reset(self):
         self._total_rts = 0.0
         self._total_replenish = 0.0
+        self._total_sold = 0.0
+        self._total_stockout = 0.0
     
     def compute(self, info: Dict, state_info: Dict) -> float:
-        sold = info.get("sold", 0)
+        """参考 rl_0113 基线的奖励计算（已验证有效）"""
+        bind = info.get("bind", 0)
         rts = info.get("rts", 0)
+        estimate_rts = info.get("estimate_rts", 0)
+        overnight = info.get("overnight", 0)
         stockout = info.get("stockout", 0)
-        replenish = info.get("replenish", 0)
+        sold = info.get("sold", 0)
         end_stock = info.get("end_stock", 0)
+        replenish = info.get("replenish", 0)
         
         avg_sales = state_info.get("avg_daily_sales", 1.0)
-        pred_y = state_info.get("pred_y", 1.0)
-        norm_factor = max(avg_sales, pred_y, 1.0)
-        demand = sold + stockout  # 实际需求
+        order_ratio_7d = state_info.get("order_ratio_7d", 0.5)
         
         # 更新统计
         self._total_rts += rts
         self._total_replenish += replenish
+        self._total_sold += sold
+        self._total_stockout += stockout
         
-        # ========== 1. 销售奖励 (核心: 提高ACC) ==========
-        # 卖出越多越好
-        sell_reward = self.sell_ratio_weight * (sold / norm_factor)
+        # 归一化因子（按SKU日均需求，使不同SKU的奖励量纲一致）
+        norm = max(avg_sales, 0.1)
         
-        # ========== 2. 缺货惩罚 (核心: 鼓励补货) ==========
-        # 缺货越多惩罚越重
-        stockout_penalty = self.sell_ratio_weight * 0.5 * (stockout / norm_factor)
+        # ========== 核心奖励 (参考基线 with_safe_stock) ==========
         
-        # ========== 3. RTS惩罚 (核心: 控制RTS) ==========
-        rts_penalty = 0.0
-        if rts > 0:
-            rts_penalty = self.rts_weight * (rts / norm_factor)
+        # 1. Bind奖励：到货即售（正向激励补货）
+        bind_reward = self.bind_weight * (bind / norm)
         
-        # ========== 4. 库存过多惩罚 (预防性，较弱) ==========
-        overstock_penalty = 0.0
-        days_of_stock = end_stock / max(avg_sales, 0.1)
-        if days_of_stock > 12:  # 放宽到12天
-            overstock_penalty = self.overstock_weight * min((days_of_stock - 12) / 10, 1.0)
+        # 2. 预估RTS惩罚（关键！前瞻性信号，非事后惩罚）
+        rts_penalty = self.rts_weight * (estimate_rts / norm)
         
-        # ========== 5. 累计RTS率惩罚 (软约束) ==========
-        cumulative_penalty = 0.0
-        if self._total_replenish > 100:  # 有一定补货量后才计算
-            current_rts_rate = self._total_rts / self._total_replenish
-            if current_rts_rate > self.max_rts_rate:
-                cumulative_penalty = 1.0 * (current_rts_rate - self.max_rts_rate)
+        # 3. 过夜持有成本
+        overnight_penalty = self.overnight_weight * min(overnight / norm, 14.0)
         
-        # 总reward
-        reward = sell_reward - stockout_penalty - rts_penalty - overstock_penalty - cumulative_penalty
+        # 4&5. 头部SKU专属：安全库存缺口 + 缺货惩罚（推动ACC的关键）
+        safe_stock_penalty = 0.0
+        stockout_penalty = 0.0
+        if order_ratio_7d >= self.head_sku_threshold:
+            # safe_stock_standard 表示安全库存天数，stock_gap 也归一化为天数
+            stock_gap = max(0, self.safe_stock_standard - end_stock / norm)
+            safe_stock_penalty = self.safe_stock_weight * stock_gap
+            stockout_penalty = self.stockout_weight * (stockout / norm)
+        
+        reward = bind_reward - rts_penalty - overnight_penalty - safe_stock_penalty - stockout_penalty
         reward = np.clip(reward, self.clip_range[0], self.clip_range[1])
         
         self._components = {
-            "sell_ratio": sell_reward,
-            "rts": -rts_penalty,
-            "overstock": -overstock_penalty,
-            "cumulative": -cumulative_penalty,
+            "bind": bind_reward,
+            "rts_penalty": -rts_penalty,
+            "overnight": -overnight_penalty,
+            "safe_stock": -safe_stock_penalty,
+            "stockout": -stockout_penalty,
+            "is_head": float(order_ratio_7d >= self.head_sku_threshold),
             "total": reward,
         }
         
         return reward
+    
+    def compute_terminal_reward(self) -> float:
+        """终止态奖励（可选，默认不启用，依赖即时逐步奖励信号）"""
+        return 0.0
     
     def get_components(self) -> Dict[str, float]:
         return self._components.copy()
@@ -474,12 +496,15 @@ def create_reward(config: dict) -> BaseReward:
     
     elif reward_type == "balanced":
         return BalancedReward(
-            sell_ratio_weight=weights.get("sell_ratio", 1.0),
-            rts_weight=weights.get("rts_penalty", 3.0),
-            overstock_weight=weights.get("overstock_penalty", 0.5),
-            max_rts_rate=targets.get("max_rts_rate", 0.024),
-            normalize=reward_cfg.get("normalize", True),
-            clip_range=tuple(reward_cfg.get("clip_range", [-5, 5])),
+            bind_weight=weights.get("bind", 0.18),
+            rts_weight=weights.get("rts", 0.8),
+            overnight_weight=weights.get("overnight", 0.01),
+            safe_stock_weight=weights.get("safe_stock", 0.4),
+            stockout_weight=weights.get("stockout", 0.3),
+            safe_stock_standard=targets.get("safe_stock_standard", 0.6),
+            head_sku_threshold=targets.get("head_sku_threshold", 0.8),
+            normalize=reward_cfg.get("normalize", False),
+            clip_range=tuple(reward_cfg.get("clip_range", [-10, 10])),
         )
     
     elif reward_type == "simple":
