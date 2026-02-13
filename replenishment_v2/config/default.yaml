@@ -12,8 +12,8 @@ task:
   device: "auto"
 
 data:
-  train_path: "../data/100k_sku.parquet"
-  eval_path: "../data/100k_sku.parquet"
+  train_path: "../data/2000_sku.parquet"
+  eval_path: "../data/2000_sku.parquet"
 
 env:
   rts_days: 14
@@ -67,10 +67,10 @@ reward:
     bind: 0.3
     rts: 0.45
     overnight: 0.005
-    safe_stock: 0.5
-    stockout: 0.6
+    safe_stock: 0.45
+    stockout: 0.4
   targets:
-    safe_stock_standard: 1.2
+    safe_stock_standard: 0.9
     head_sku_threshold: 0.3
   use_terminal_reward: false     # 禁用终止态奖励，依赖逐步信号
   normalize: false
@@ -110,7 +110,7 @@ ppo:
 
 # ============ 训练配置 ============
 training:
-  max_episodes: 200
+  max_episodes: 50
   eval_interval: 10
   save_interval: 50
   early_stop_patience: 50
@@ -126,23 +126,23 @@ training:
     enabled: true
     stages:
       - name: "warmup_bind"
-        episodes: 30
+        episodes: 15
         rts_weight: 0.35
         bind_weight: 0.3
         overnight_weight: 0.005
         safe_stock_weight: 0.4
       - name: "balance"
-        episodes: 70
+        episodes: 20
         rts_weight: 0.45
         bind_weight: 0.3
         overnight_weight: 0.005
-        safe_stock_weight: 0.5
+        safe_stock_weight: 0.45
       - name: "acc_focus"
-        episodes: 100
+        episodes: 15
         rts_weight: 0.45
         bind_weight: 0.3
         overnight_weight: 0.005
-        safe_stock_weight: 0.5
+        safe_stock_weight: 0.45
 
 logging:
   log_dir: "output"
