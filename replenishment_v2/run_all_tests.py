@@ -23,6 +23,30 @@ CONFIG_PATH = Path(__file__).parent / "config" / "default.yaml"
 LOG_DIR = Path(__file__).parent / "output"
 
 
+def write_report(log_file, timestamp, results):
+    with open(log_file, "w", encoding="utf-8") as f:
+        f.write(f"Batch Test Report  {timestamp}\n")
+        f.write("=" * 60 + "\n\n")
+        f.write(f"{'Dataset':<25} {'ACC':>8} {'RTS':>8} {'Status':>8}\n")
+        f.write("-" * 55 + "\n")
+        for r in results:
+            f.write(f"{r['dataset']:<25} {r['acc']:>7.2f}% {r['rts']:>7.2f}% {r['status']:>8}\n")
+        f.write("-" * 55 + "\n")
+
+        if results:
+            avg_acc = sum(r["acc"] for r in results) / len(results)
+            avg_rts = sum(r["rts"] for r in results) / len(results)
+            all_pass = all(r["status"] == "PASS" for r in results)
+        else:
+            avg_acc, avg_rts, all_pass = 0.0, 0.0, False
+
+        f.write(f"{'Average':<25} {avg_acc:>7.2f}% {avg_rts:>7.2f}%\n\n")
+        f.write(f"Verdict: {'ALL PASS' if all_pass else 'NOT ALL PASS'}\n")
+        f.write(f"Target: ACC >= 80%, RTS <= 2.4%\n")
+
+    return avg_acc, avg_rts
+
+
 def update_config(dataset_name):
     rel_path = f"../data/{dataset_name}"
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
@@ -82,23 +106,7 @@ def main():
             print(f"    Failed to parse metrics")
 
         results.append({"dataset": ds, "acc": acc, "rts": rts, "status": status})
-
-    # 写日志
-    with open(log_file, "w", encoding="utf-8") as f:
-        f.write(f"Batch Test Report  {timestamp}\n")
-        f.write("=" * 60 + "\n\n")
-        f.write(f"{'Dataset':<25} {'ACC':>8} {'RTS':>8} {'Status':>8}\n")
-        f.write("-" * 55 + "\n")
-        for r in results:
-            f.write(f"{r['dataset']:<25} {r['acc']:>7.2f}% {r['rts']:>7.2f}% {r['status']:>8}\n")
-        f.write("-" * 55 + "\n")
-
-        avg_acc = sum(r["acc"] for r in results) / len(results)
-        avg_rts = sum(r["rts"] for r in results) / len(results)
-        all_pass = all(r["status"] == "PASS" for r in results)
-        f.write(f"{'Average':<25} {avg_acc:>7.2f}% {avg_rts:>7.2f}%\n\n")
-        f.write(f"Verdict: {'ALL PASS' if all_pass else 'NOT ALL PASS'}\n")
-        f.write(f"Target: ACC >= 80%, RTS <= 2.4%\n")
+        avg_acc, avg_rts = write_report(log_file, timestamp, results)
 
     # 终端输出汇总
     print("\n" + "=" * 60)
