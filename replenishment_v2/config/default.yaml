@@ -98,8 +98,8 @@ ppo:
   lr_critic: 0.0003
   weight_decay: 0.0
   k_epochs: 4                   # 基线=3，折中取4
-  batch_size: 2048               # 减小以加速更新
-  mini_batch_size: 512
+  batch_size: 8192
+  mini_batch_size: 2048
   normalize_advantages: true
   advantage_clip: 5.0
   log_ratio_clip: 20.0
@@ -116,7 +116,8 @@ training:
   early_stop_patience: 50
   target_rts: 2.4
   target_acc: 80.0
-  accumulate_episodes: 1         # 每个episode更新一次（基线风格）
+  accumulate_episodes: 1
+  sku_sample_size: 10000
   use_terminal_reward: false
   use_state_norm: true
   use_reward_norm: true          # 启用奖励归一化（处理不同SKU的规模差异）

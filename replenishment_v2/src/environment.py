@@ -104,7 +104,7 @@ class ReplenishmentEnv(gym.Env):
                 dtype=np.float32
             )
     
-    def reset(self, seed: Optional[int] = None) -> Dict[str, np.ndarray]:
+    def reset(self, seed: Optional[int] = None, sku_sample_size: int = 0) -> Dict[str, np.ndarray]:
         """
         重置环境
         
@@ -117,9 +117,15 @@ class ReplenishmentEnv(gym.Env):
         self.day_idx_map = {}
         self.done_map = {}
         
+        if sku_sample_size > 0 and sku_sample_size < len(self.sku_ids):
+            active_ids = list(np.random.choice(self.sku_ids, sku_sample_size, replace=False))
+        else:
+            active_ids = self.sku_ids
+        self._active_ids = active_ids
+        
         state_map = {}
         
-        for sku_id in self.sku_ids:
+        for sku_id in active_ids:
             # 初始化模拟器状态
             initial_stock = self.dataset.initial_stock_map.get(sku_id, 0)
             self.sku_states[sku_id] = self.simulator.init_sku(sku_id, initial_stock)
@@ -154,8 +160,8 @@ class ReplenishmentEnv(gym.Env):
         reward_map = {}
         info_map = {}
         
-        for sku_id in self.sku_ids:
-            if self.done_map[sku_id]:
+        for sku_id in getattr(self, '_active_ids', self.sku_ids):
+            if sku_id not in self.done_map or self.done_map[sku_id]:
                 continue
             
             if sku_id not in action_map:
@@ -412,7 +418,7 @@ class ReplenishmentEnv(gym.Env):
         total_overnight = 0.0
         total_stockout = 0.0
         
-        for sku_id in self.sku_ids:
+        for sku_id in getattr(self, '_active_ids', self.sku_ids):
             summary = self.simulator.get_summary(self.sku_states[sku_id])
             total_replenish += summary["total_replenish"]
             total_bind += summary["total_bind"]
@@ -422,7 +428,13 @@ class ReplenishmentEnv(gym.Env):
             total_stockout += summary["total_stockout"]
         
         # 计算指标
-        market_sales = self.dataset.total_sales
+        active = getattr(self, '_active_ids', self.sku_ids)
+        if len(active) < len(self.sku_ids):
+            market_sales = sum(
+                sum(self.dataset.sales_map[sid]) for sid in active
+            )
+        else:
+            market_sales = self.dataset.total_sales
         acc = total_sales / market_sales * 100 if market_sales > 0 else 0.0
         rts_rate = total_rts / total_replenish * 100 if total_replenish > 0 else 0.0
         

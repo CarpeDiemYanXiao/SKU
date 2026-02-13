@@ -186,7 +186,8 @@ def train_episode(
     reward_normalizer: RewardNormalizer = None,
     use_state_norm: bool = False,
     use_reward_norm: bool = False,
-    use_terminal_reward: bool = True,  # 新增: 终止态奖励
+    use_terminal_reward: bool = True,
+    sku_sample_size: int = 0,
 ) -> dict:
     """
     训练一个 episode (批量优化版本，支持状态/奖励归一化)
@@ -205,7 +206,7 @@ def train_episode(
         episode 统计信息
     """
     # 注意：不在这里 reset buffer，让 buffer 可以累积多个 episode
-    state_map = env.reset()
+    state_map = env.reset(sku_sample_size=sku_sample_size)
     
     # 重置奖励归一化器的累积回报
     if reward_normalizer:
@@ -548,6 +549,8 @@ def main():
         # 终止态奖励配置
         use_terminal_reward = train_cfg.get("use_terminal_reward", True)
         
+        sku_sample_size = train_cfg.get("sku_sample_size", 0)
+        
         episode_stats = train_episode(
             env, agent, buffer,
             state_normalizer=state_normalizer,
@@ -555,6 +558,7 @@ def main():
             use_state_norm=use_state_norm,
             use_reward_norm=use_reward_norm,
             use_terminal_reward=use_terminal_reward,
+            sku_sample_size=sku_sample_size,
         )
         
         # PPO 更新
