@@ -123,7 +123,7 @@ class ReplenishmentDataset:
     
     def _build_demand_calibration(self, df, grouped):
         self._calib_map = {}
-        alpha = 0.2
+        alpha = 0.3
         for sku_id in self.sku_ids:
             n_days = self.n_days_map[sku_id]
             preds_arr = self.predicts_map[sku_id]

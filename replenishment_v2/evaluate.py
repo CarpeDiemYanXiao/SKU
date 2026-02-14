@@ -108,111 +108,105 @@ def evaluate_model(
     }
 
 
-def main():
-    parser = argparse.ArgumentParser(description="库存补货 RL 评估")
-    parser.add_argument("--config", type=str, default="config/default.yaml", help="配置文件路径")
-    parser.add_argument("--model_path", type=str, required=True, help="模型路径")
-    parser.add_argument("--data_path", type=str, default=None, help="测试数据路径")
-    parser.add_argument("--output", type=str, default=None, help="结果输出路径")
-    parser.add_argument("--verbose", action="store_true", help="详细输出")
-    args = parser.parse_args()
-    
-    # 加载配置
-    config = load_config(args.config)
-    
-    # 覆盖数据路径
-    if args.data_path:
-        config["data"]["eval_path"] = args.data_path
-    
-    # 设置随机种子
-    set_seed(config["task"].get("seed", 42))
-    
-    # 设备
-    device = config["task"].get("device", "cpu")
-    print(f"[Eval] Device: {device}")
-    
-    # 加载数据
-    print("[Eval] Loading dataset...")
-    data_path = args.data_path or config["data"].get("eval_path", config["data"]["train_path"])
+DATASETS = [
+    "100k_sku.parquet",
+    "100k_sku_v2.parquet",
+    "100k_sku_v3.parquet",
+    "100k_sku_v4.parquet",
+    "100k_sku_v6.parquet",
+]
+
+
+def eval_single(config, data_path, agent, device, verbose=False):
+    """对单个数据集评估，返回 (acc, rts)"""
     static_features = config["env"]["state_features"]["static"]
     dataset = ReplenishmentDataset(
         file_path=data_path,
         static_features=static_features,
     )
-    print(f"[Eval] Dataset: {dataset.n_skus} SKUs")
-    
-    # 创建环境
-    print("[Eval] Creating environment...")
     env = create_env(dataset, config)
-    
-    # 加载模型
-    print(f"[Eval] Loading model from {args.model_path}...")
-    agent = PPOAgent(config, device=device)
-    checkpoint = agent.load(args.model_path)
-    
-    # 加载状态归一化器（训练时保存在 checkpoint 中）
+
     state_normalizer = None
     norm_clip = config.get("training", {}).get("norm_clip", 10.0)
-    if checkpoint and "state_norm_state" in checkpoint:
+    ckpt = agent._last_checkpoint
+    if ckpt and "state_norm_state" in ckpt:
         state_normalizer = StateNormalizer(
             shape=(env.state_dim,), clip=norm_clip, update=False)
-        state_normalizer.running_ms.load_state(checkpoint["state_norm_state"])
-        print("[Eval] State normalizer loaded from checkpoint")
-    
-    # 评估
-    print("[Eval] Running evaluation...")
-    results = evaluate_model(env, agent, state_normalizer=state_normalizer, verbose=args.verbose)
-    
-    # 打印结果
-    global_metrics = results["global"]
-    print("\n" + "=" * 60)
-    print("EVALUATION RESULTS")
-    print("=" * 60)
-    print(f"ACC (售出率):      {global_metrics['acc']:.2f}%")
-    print(f"RTS (退货率):      {global_metrics['rts_rate']:.2f}%")
-    print(f"总补货量:          {global_metrics['total_replenish']:.0f}")
-    print(f"总售出量:          {global_metrics['total_sales']:.0f}")
-    print(f"总退货量:          {global_metrics['total_rts']:.0f}")
-    print(f"总缺货量:          {global_metrics['total_stockout']:.0f}")
-    print(f"市场销量:          {global_metrics['market_sales']:.0f}")
-    print("=" * 60)
-    
-    # 与 baseline 对比
-    baseline_acc = 75.0
-    baseline_rts = 2.4
-    
-    acc_diff = global_metrics["acc"] - baseline_acc
-    rts_diff = global_metrics["rts_rate"] - baseline_rts
-    
-    print(f"\n与 Baseline 对比:")
-    print(f"  ACC: {acc_diff:+.2f}% ({'✓ 达标' if acc_diff >= 5 else '✗ 未达标'})")
-    print(f"  RTS: {rts_diff:+.2f}% ({'✓ 达标' if rts_diff <= 0 else '✗ 未达标'})")
-    
-    if acc_diff >= 5 and rts_diff <= 0:
-        print("\n🎉 恭喜! 达成目标: ACC提升≥5%, RTS不升高!")
-    
-    # 保存结果
+        state_normalizer.running_ms.load_state(ckpt["state_norm_state"])
+
+    results = evaluate_model(env, agent, state_normalizer=state_normalizer, verbose=verbose)
+    g = results["global"]
+    return g["acc"], g["rts_rate"]
+
+
+def main():
+    parser = argparse.ArgumentParser(description="库存补货 RL 评估")
+    parser.add_argument("--config", type=str, default="config/default.yaml", help="配置文件路径")
+    parser.add_argument("--model_path", type=str, required=True, help="模型路径")
+    parser.add_argument("--data_path", type=str, default=None, help="单个测试数据路径（不传则跑5个100k）")
+    parser.add_argument("--output", type=str, default=None, help="结果输出路径")
+    parser.add_argument("--verbose", action="store_true", help="详细输出")
+    args = parser.parse_args()
+
+    config = load_config(args.config)
+    set_seed(config["task"].get("seed", 42))
+    device = config["task"].get("device", "cpu")
+
+    # 加载模型（只加载一次）
+    agent = PPOAgent(config, device=device)
+    checkpoint = agent.load(args.model_path)
+    agent._last_checkpoint = checkpoint
+
+    # 单数据集模式
+    if args.data_path:
+        acc, rts = eval_single(config, args.data_path, agent, device, args.verbose)
+        print(f"ACC={acc:.2f}%  RTS={rts:.2f}%")
+        return
+
+    # 批量模式: 依次评估5个100k测试集
+    data_dir = Path(__file__).parent / ".." / "data"
+    summary = []
+
+    print("=" * 55)
+    print(f"Batch Evaluate: {len(DATASETS)} datasets")
+    print(f"Model: {args.model_path}")
+    print("=" * 55)
+
+    for i, ds in enumerate(DATASETS, 1):
+        dp = str((data_dir / ds).resolve())
+        print(f"\n[{i}/{len(DATASETS)}] {ds} ...", flush=True)
+        acc, rts = eval_single(config, dp, agent, device, args.verbose)
+        status = "PASS" if acc >= 80.0 and rts <= 2.4 else "FAIL"
+        print(f"  ACC={acc:.2f}%  RTS={rts:.2f}%  [{status}]")
+        summary.append({"dataset": ds, "acc": acc, "rts": rts, "status": status})
+
+    # 汇总
+    avg_acc = sum(r["acc"] for r in summary) / len(summary)
+    avg_rts = sum(r["rts"] for r in summary) / len(summary)
+    all_pass = all(r["status"] == "PASS" for r in summary)
+
+    print("\n" + "=" * 55)
+    print(f"{'Dataset':<25} {'ACC':>8} {'RTS':>8} {'Status':>8}")
+    print("-" * 55)
+    for r in summary:
+        print(f"{r['dataset']:<25} {r['acc']:>7.2f}% {r['rts']:>7.2f}% {r['status']:>8}")
+    print("-" * 55)
+    print(f"{'Average':<25} {avg_acc:>7.2f}% {avg_rts:>7.2f}%")
+    print(f"Verdict: {'ALL PASS' if all_pass else 'NOT ALL PASS'}")
+    print(f"Target: ACC >= 80%, RTS <= 2.4%")
+
+    # 保存日志
     if args.output:
-        output_path = Path(args.output)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        
-        # 保存 SKU 级别指标
-        sku_df = pd.DataFrame.from_dict(results["sku_metrics"], orient="index")
-        sku_df.to_csv(output_path.with_suffix(".sku_metrics.csv"))
-        
-        # 保存全局指标
-        with open(output_path, "w") as f:
-            f.write("EVALUATION RESULTS\n")
-            f.write("=" * 40 + "\n")
-            for key, value in global_metrics.items():
-                f.write(f"{key}: {value}\n")
-            f.write("\nBASELINE COMPARISON\n")
-            f.write(f"ACC diff: {acc_diff:+.2f}%\n")
-            f.write(f"RTS diff: {rts_diff:+.2f}%\n")
-        
-        print(f"\n[Eval] Results saved to {args.output}")
-    
-    return global_metrics
+        out = Path(args.output)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        with open(out, "w", encoding="utf-8") as f:
+            f.write(f"{'Dataset':<25} {'ACC':>8} {'RTS':>8} {'Status':>8}\n")
+            f.write("-" * 55 + "\n")
+            for r in summary:
+                f.write(f"{r['dataset']:<25} {r['acc']:>7.2f}% {r['rts']:>7.2f}% {r['status']:>8}\n")
+            f.write("-" * 55 + "\n")
+            f.write(f"{'Average':<25} {avg_acc:>7.2f}% {avg_rts:>7.2f}%\n")
+        print(f"\nLog saved to {out}")
 
 
 if __name__ == "__main__":

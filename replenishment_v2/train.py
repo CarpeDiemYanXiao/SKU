@@ -77,6 +77,15 @@ if _use_npu:
         pass
 
 
+DATASETS = [
+    "100k_sku.parquet",
+    "100k_sku_v2.parquet",
+    "100k_sku_v3.parquet",
+    "100k_sku_v4.parquet",
+    "100k_sku_v6.parquet",
+]
+
+
 class RolloutBuffer:
     """
     Rollout Buffer（增强版）
@@ -424,19 +433,48 @@ def main():
         device = device_config
         print(f"[Train] Device: {device}")
     
-    # 加载数据
-    print("[Train] Loading dataset...")
+    # 加载数据（多数据集）
     static_features = config["env"]["state_features"]["static"]
-    dataset = ReplenishmentDataset(
-        file_path=config["data"]["train_path"],
-        static_features=static_features,
-    )
-    print(f"[Train] Dataset: {dataset.n_skus} SKUs")
-    
-    # 创建环境
-    print("[Train] Creating environment...")
+    data_dir = Path(__file__).parent / ".." / "data"
+    single_data = config["data"].get("train_path", "")
+    is_multi = any(k in single_data for k in ["100k"])
+
     reward_fn = create_reward(config)
-    env = create_env_with_reward(dataset, config, reward_fn)
+    datasets = []
+    envs = []
+
+    if is_multi or args.data_path is None:
+        available = [d for d in DATASETS if (data_dir / d).exists()]
+        if len(available) >= 2:
+            print(f"[Train] Multi-dataset mode: {len(available)} datasets")
+            for ds_name in available:
+                ds = ReplenishmentDataset(
+                    file_path=str((data_dir / ds_name).resolve()),
+                    static_features=static_features,
+                )
+                datasets.append(ds)
+                envs.append(create_env_with_reward(ds, config, reward_fn))
+                print(f"  - {ds_name}: {ds.n_skus} SKUs")
+        else:
+            ds = ReplenishmentDataset(
+                file_path=config["data"]["train_path"],
+                static_features=static_features,
+            )
+            datasets.append(ds)
+            envs.append(create_env_with_reward(ds, config, reward_fn))
+            print(f"[Train] Single dataset: {ds.n_skus} SKUs")
+    else:
+        ds = ReplenishmentDataset(
+            file_path=config["data"]["train_path"],
+            static_features=static_features,
+        )
+        datasets.append(ds)
+        envs.append(create_env_with_reward(ds, config, reward_fn))
+        print(f"[Train] Single dataset: {ds.n_skus} SKUs")
+
+    n_envs = len(envs)
+    env = envs[0]  # 默认环境（用于state_dim等）
+    dataset = datasets[0]
     
     # 计算 state_dim
     n_dynamic = len(config["env"]["state_features"]["dynamic"])
@@ -551,8 +589,9 @@ def main():
         
         sku_sample_size = train_cfg.get("sku_sample_size", 0)
         
+        cur_env = envs[episode % n_envs]
         episode_stats = train_episode(
-            env, agent, buffer,
+            cur_env, agent, buffer,
             state_normalizer=state_normalizer,
             reward_normalizer=reward_normalizer,
             use_state_norm=use_state_norm,
@@ -587,38 +626,40 @@ def main():
                 f"ACC={episode_stats['acc']:.1f}% RTS={episode_stats['rts_rate']:.1f}%"
             )
         
-        # 评估
+        # 评估（多数据集）
         if episode % eval_interval == 0:
-            eval_metrics = evaluate(env, agent, state_normalizer, use_state_norm)
-            
-            tqdm.write(f"ACC={eval_metrics['acc']:.2f}% | RTS={eval_metrics['rts_rate']:.2f}%")
-            
+            all_acc, all_rts = [], []
+            for ei, ev in enumerate(envs):
+                em = evaluate(ev, agent, state_normalizer, use_state_norm)
+                all_acc.append(em["acc"])
+                all_rts.append(em["rts_rate"])
+
+            avg_acc = sum(all_acc) / len(all_acc)
+            avg_rts = sum(all_rts) / len(all_rts)
+
+            parts = "  ".join(f"{a:.1f}/{r:.1f}" for a, r in zip(all_acc, all_rts))
+            tqdm.write(f"Avg ACC={avg_acc:.2f}% RTS={avg_rts:.2f}%  [{parts}]")
+
             if writer:
-                writer.add_scalar("eval/acc", eval_metrics["acc"], episode)
-                writer.add_scalar("eval/rts_rate", eval_metrics["rts_rate"], episode)
-            
-            # 模型选择逻辑
+                writer.add_scalar("eval/acc", avg_acc, episode)
+                writer.add_scalar("eval/rts_rate", avg_rts, episode)
+                for ei in range(len(envs)):
+                    writer.add_scalar(f"eval/acc_ds{ei}", all_acc[ei], episode)
+                    writer.add_scalar(f"eval/rts_ds{ei}", all_rts[ei], episode)
+
+            # 模型选择：用所有数据集的平均指标
             target_rts = train_cfg.get("target_rts", 2.4)
-            target_acc = train_cfg.get("target_acc", 80.0)
-            
-            current_rts = eval_metrics["rts_rate"]
-            current_acc = eval_metrics["acc"]
-            
-            if current_rts <= target_rts:
-                rts_bonus = 10.0
-                combined_score = current_acc + rts_bonus
+
+            if avg_rts <= target_rts:
+                combined_score = avg_acc + 10.0
             else:
-                rts_excess = current_rts - target_rts
-                rts_penalty = rts_excess * 3.0
-                combined_score = current_acc - rts_penalty
-            
-            # 保存最佳模型
+                combined_score = avg_acc - (avg_rts - target_rts) * 3.0
+
             if combined_score > best_combined_score:
                 best_combined_score = combined_score
-                best_acc = eval_metrics["acc"]
-                best_rts = eval_metrics["rts_rate"]
-                
-                # 保存完整 checkpoint
+                best_acc = avg_acc
+                best_rts = avg_rts
+
                 extra_info = {
                     "episode": episode,
                     "best_acc": best_acc,
@@ -629,11 +670,10 @@ def main():
                     extra_info["state_norm_state"] = state_normalizer.running_ms.save_state()
                 if use_reward_norm:
                     extra_info["reward_norm_state"] = reward_normalizer.running_ms.save_state()
-                
+
                 agent.save(str(output_dir / "best_model.pth"), extra_info=extra_info)
                 tqdm.write(f"  -> Best: ACC={best_acc:.2f}% RTS={best_rts:.2f}%")
-            
-            # 早停检查
+
             if early_stopping(combined_score):
                 tqdm.write(f"Early stop at ep {episode}")
                 pbar.close()
