@@ -17,7 +17,6 @@ sys.path.insert(0, str(Path(__file__).parent))
 from src.dataset import ReplenishmentDataset
 from src.environment import create_env
 from src.agent import PPOAgent
-from src.reward import create_reward
 from src.utils import load_config, set_seed, StateNormalizer
 
 
